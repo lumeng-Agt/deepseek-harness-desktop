@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>DeepSeek Harness</title>
+<style>
+  html,body{margin:0;height:100%;background:#101418;color:#c9d1d9;
+    font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;
+    display:flex;align-items:center;justify-content:center;}
+  .box{text-align:center;}
+  .logo{width:88px;height:88px;margin:0 auto 20px;display:block;}
+  .spin{width:28px;height:28px;margin:18px auto 0;border:3px solid #2b3a4a;
+    border-top-color:#4d6bfe;border-radius:50%;animation:r 0.8s linear infinite;}
+  @keyframes r{to{transform:rotate(360deg)}}
+  .h{font-size:17px;font-weight:600;}
+  .s{font-size:13px;color:#8b949e;margin-top:6px;}
+</style>
+</head>
+<body>
+  <div class="box">
+    <img class="logo" src="icon.png" alt="DeepSeek" />
+    <div class="h">DeepSeek Harness</div>
+    <div class="s">正在启动…</div>
+    <div class="spin"></div>
+  </div>
+</body>
+</html>
