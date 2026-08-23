@@ -14,6 +14,13 @@ const BIN = cfg.DSH_BIN;
 const WALLPAPER_DIR = cfg.WALLPAPER_DIR;
 const WORKSPACE = cfg.WORKSPACE;
 const SETTINGS_FILE = path.join(app.getPath('userData'), 'wallpaper.json');
+const DSH_STATE_FILE = path.join(app.getPath('userData'), 'dsh-server.json');
+const DSH_LOG_FILE = path.join(app.getPath('userData'), 'dsh-web.log');
+
+let dshChild = null;
+let dshOwnedPid = null;
+let dshStopping = null;
+let quitting = false;
 
 // Must run before app is ready, so media elements can load wallpaper:// URLs
 protocol.registerSchemesAsPrivileged([
@@ -41,7 +48,7 @@ function findFtyp(buf) {
 function extractBestImage(buf) {
   const images = [];
   const pngSig = Buffer.from([0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]);
-  const iendSig = Buffer.from([0x49,0x45,0x4E,0x44,0x0D,0x0A,0x1A,0x0A]);
+  const iendSig = Buffer.from([0x49,0x45,0x4E,0x44,0xAE,0x42,0x60,0x82]);
   let pos = 0;
   while (true) {
     const i = buf.indexOf(pngSig, pos);
@@ -172,15 +179,136 @@ function isServerUp() {
     socket.connect(PORT, HOST);
   });
 }
+
+function readDshState() {
+  try {
+    const state = JSON.parse(fs.readFileSync(DSH_STATE_FILE, 'utf8'));
+    if (!state || !Number.isInteger(state.pid) || state.pid <= 0) return null;
+    return state;
+  } catch (e) {
+    return null;
+  }
+}
+
+function writeDshState(pid) {
+  try {
+    fs.writeFileSync(DSH_STATE_FILE, JSON.stringify({
+      pid,
+      workspace: WORKSPACE,
+      startedAt: new Date().toISOString()
+    }, null, 2));
+  } catch (e) {}
+}
+
+function clearDshState(pid) {
+  try {
+    const state = readDshState();
+    if (state && state.pid !== pid) return;
+    fs.unlinkSync(DSH_STATE_FILE);
+  } catch (e) {}
+}
+
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function logDshLifecycle(message) {
+  try {
+    fs.appendFileSync(DSH_LOG_FILE, `${new Date().toISOString()} [desktop] ${message}\n`);
+  } catch (e) {}
+}
+
 function startServer() {
-  if (!BIN || !NODE) return;
-  const child = spawn(NODE, [BIN, 'web'], { cwd: WORKSPACE, detached: true, stdio: 'ignore', windowsHide: true });
-  child.unref();
+  if (!BIN || !NODE) return null;
+  if (dshChild && !dshChild.killed && isProcessAlive(dshChild.pid)) return dshChild;
+
+  const log = fs.createWriteStream(DSH_LOG_FILE, { flags: 'a' });
+  let child;
+  try {
+    child = spawn(NODE, [BIN, 'web'], {
+      cwd: WORKSPACE,
+      detached: false,
+      stdio: ['ignore', log, log],
+      windowsHide: true
+    });
+  } catch (error) {
+    logDshLifecycle(`process spawn error: ${error.message}`);
+    log.end();
+    return null;
+  }
+
+  dshChild = child;
+  dshOwnedPid = child.pid ?? null;
+  if (dshOwnedPid !== null) writeDshState(dshOwnedPid);
+  logDshLifecycle(`started pid=${dshOwnedPid ?? 'unknown'} workspace=${WORKSPACE}`);
+  child.once('error', (error) => logDshLifecycle(`process error: ${error.message}`));
+  child.once('exit', (code, signal) => {
+    logDshLifecycle(`exited pid=${child.pid ?? 'unknown'} code=${code ?? 'null'} signal=${signal ?? 'null'}`);
+    clearDshState(child.pid);
+    if (dshChild === child) dshChild = null;
+    if (dshOwnedPid === child.pid) dshOwnedPid = null;
+    log.end();
+  });
+  return child;
+}
+
+function adoptOwnedServer() {
+  const state = readDshState();
+  if (!state || !isProcessAlive(state.pid)) {
+    if (state) clearDshState(state.pid);
+    return null;
+  }
+  dshOwnedPid = state.pid;
+  logDshLifecycle(`adopted existing pid=${state.pid}`);
+  return state.pid;
+}
+
+function killServerProcess(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearDshState(pid);
+      if (dshChild?.pid === pid) dshChild = null;
+      if (dshOwnedPid === pid) dshOwnedPid = null;
+      resolve();
+    };
+    if (!isProcessAlive(pid)) return finish();
+    try { process.kill(pid); } catch (e) {}
+    setTimeout(() => {
+      if (!isProcessAlive(pid)) return finish();
+      if (process.platform === 'win32') {
+        const killer = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+        killer.once('close', finish);
+        killer.once('error', finish);
+      } else {
+        try { process.kill(pid, 'SIGKILL'); } catch (e) {}
+        finish();
+      }
+    }, 1500);
+  });
+}
+
+function stopServer() {
+  if (dshStopping) return dshStopping;
+  const pid = dshChild?.pid ?? dshOwnedPid ?? readDshState()?.pid;
+  dshStopping = killServerProcess(pid).finally(() => { dshStopping = null; });
+  return dshStopping;
 }
 async function ensureServer() {
-  if (await isServerUp()) return true;
+  if (await isServerUp()) {
+    if (adoptOwnedServer() === null) logDshLifecycle('using an existing unowned server on the configured port');
+    return true;
+  }
   if (!BIN || !NODE) return false;
-  startServer();
+  if (!startServer()) return false;
   for (let i = 0; i < 40; i++) { await new Promise((r) => setTimeout(r, 1000)); if (await isServerUp()) return true; }
   return false;
 }
@@ -191,6 +319,10 @@ const MIME = {
   '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
   '.mp4': 'video/mp4', '.webm': 'video/webm', '.m4v': 'video/mp4'
 };
+
+function logProtocol(msg) {
+  try { fs.appendFileSync(path.join(app.getPath('userData'), 'protocol.log'), new Date().toISOString() + ' ' + msg + '\n'); } catch (e) {}
+}
 
 function streamFile(full, start, end) {
   const nodeStream = fs.createReadStream(full, { start, end });
@@ -216,6 +348,7 @@ function registerWallpaperProtocol() {
       const full = wallpaperItemRoot ? path.resolve(wallpaperItemRoot, file) : '';
       const validId = Boolean(id) && id !== '.' && id !== '..' && !/[\\/]/.test(id);
       if (!wallpaperRoot || !validId || !wallpaperItemRoot || !isPathInside(wallpaperRoot, wallpaperItemRoot) || !isPathInside(wallpaperItemRoot, full) || !fs.existsSync(full) || !fs.statSync(full).isFile()) {
+        logProtocol('404 ' + request.url);
         return new Response('Not found', { status: 404 });
       }
       const stat = fs.statSync(full);
@@ -234,6 +367,7 @@ function registerWallpaperProtocol() {
             return new Response(null, { status: 416, headers: { 'content-range': 'bytes */' + total } });
           }
           const length = end - start + 1;
+          logProtocol('206 ' + mime + ' ' + start + '-' + end + '/' + total + ' ' + file);
           return new Response(streamFile(full, start, end), {
             status: 206,
             headers: {
@@ -245,11 +379,13 @@ function registerWallpaperProtocol() {
           });
         }
       }
+      logProtocol('200 ' + mime + ' ' + total + 'B ' + file);
       return new Response(streamFile(full, 0, total - 1), {
         status: 200,
         headers: { 'content-type': mime, 'content-length': String(total), 'accept-ranges': 'bytes' }
       });
     } catch (e) {
+      logProtocol('ERR ' + request.url + ' ' + (e && e.message));
       return new Response('Error', { status: 500 });
     }
   });
@@ -260,6 +396,10 @@ function registerIpc() {
   ipcMain.handle('wallpaper:list', () => readWallpapers());
   ipcMain.handle('wallpaper:get', () => readSetting());
   ipcMain.handle('wallpaper:set', (e, id) => { writeSetting(id ? { id } : null); return readSetting(); });
+  ipcMain.handle('wallpaper:ping', () => {
+    try { fs.appendFileSync(path.join(app.getPath('userData'), 'inject.log'), new Date().toISOString() + ' injected\n'); } catch (e) {}
+    return 'pong';
+  });
 }
 
 async function createWindow() {
@@ -317,6 +457,13 @@ if (!gotLock) {
     registerIpc();
     createWindow();
     app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
+  });
+
+  app.on('before-quit', (event) => {
+    if (quitting) return;
+    event.preventDefault();
+    quitting = true;
+    stopServer().finally(() => app.quit());
   });
 
   app.on('window-all-closed', () => { app.quit(); });

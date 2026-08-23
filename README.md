@@ -11,6 +11,8 @@
 - 🐋 自带 DeepSeek 图标
 - 🎨 应用内壁纸选择器（右下角按钮），支持视频壁纸、静态壁纸、多层场景图层
 - 🔧 自动从 Wallpaper Engine 场景包提取高清图/视频（含 LZ4 压缩精灵表解码）
+- 🔒 只清理由本应用启动的 DSH 服务；外部占用 3080 端口的服务不会被强制结束
+- 🧾 在 Electron 用户数据目录记录 DSH 生命周期日志和服务状态，方便排查启动/退出问题
 - ⚙️ 自动检测路径，无需手动配置（也可用环境变量覆盖）
 
 ## 前置要求
@@ -46,6 +48,8 @@ npm run pack
 打包结果在 `release/DeepSeek Harness-win32-x64/`，双击 `DeepSeek Harness.exe` 即可运行。
 
 应用内置 Chromium，不依赖 Edge 或 Chrome；但 DSH 命令行本身仍需单独安装，`install.cmd` 会在检测不到 `dsh` 时尝试执行 `npm install -g @deepseek-ai/dsh`。
+
+应用退出时会结束本应用自己启动的 DSH Web 子进程，并清理对应状态文件。如果 3080 端口已经被其他 DSH 实例或其他程序占用，应用会直接使用该服务，不会根据端口盲目杀进程。
 
 ## 环境变量（可选覆盖）
 
