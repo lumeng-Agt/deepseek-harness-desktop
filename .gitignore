@@ -1,5 +1,17 @@
 node_modules/
 release/
 *.log
+*.log.*
 .DS_Store
 Thumbs.db
+
+# Local DSH state, sessions and credentials must never enter the repository.
+.env
+.env.*
+!.env.example
+.dsh/
+sessions/
+session-search.sqlite*
+wallpaper-cache/
+dsh-server.json
+wallpaper.json

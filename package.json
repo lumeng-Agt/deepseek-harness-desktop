@@ -1,15 +1,25 @@
 {
-  "name": "dshgui",
-  "version": "1.0.0",
-  "description": "DeepSeek Harness 桌面 GUI：把 DSH 网页版包装成独立桌面应用，内置 Wallpaper Engine 壁纸选择器与文件解析助手",
+  "name": "deepseek-harness-desktop",
+  "version": "1.1.0",
+  "description": "DeepSeek Harness Desktop：DSH 桌面包装器、Wallpaper Engine 壁纸选择器与解析助手",
   "main": "main.js",
-  "author": "DeepSeek Harness GUI contributors",
+  "author": "DeepSeek Harness Desktop contributors",
   "license": "MIT",
   "private": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lumeng-Agt/deepseek-harness-desktop.git"
+  },
   "scripts": {
     "start": "electron .",
-    "pack": "electron-packager . \"DeepSeek Harness\" --platform=win32 --arch=x64 --icon=icon.ico --out=release --overwrite --prune=true",
-    "pack:all": "electron-packager . \"DeepSeek Harness\" --all --icon=icon.ico --out=release --overwrite --prune=true"
+    "check": "node --check main.js && node --check config.js && node --check path-discovery.js && node --check lib/path-utils.js && node --check wallpaper-helper.js",
+    "test": "node --test",
+    "audit": "npm audit --audit-level=high",
+    "pack": "electron-packager . \"DeepSeek Harness Desktop\" --platform=win32 --arch=x64 --icon=icon.ico --out=release --overwrite --prune=true",
+    "pack:all": "electron-packager . \"DeepSeek Harness Desktop\" --all --icon=icon.ico --out=release --overwrite --prune=true"
   },
   "devDependencies": {
     "@electron/packager": "^20.3.0",

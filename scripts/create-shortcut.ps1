@@ -18,7 +18,7 @@ $shortcut = $shell.CreateShortcut($shortcutPath)
 $shortcut.TargetPath = $target
 $shortcut.WorkingDirectory = Split-Path -Parent $target
 $shortcut.IconLocation = "$target,0"
-$shortcut.Description = 'DeepSeek Harness desktop application'
+$shortcut.Description = 'DeepSeek Harness Desktop application'
 $shortcut.Save()
 
 Write-Output "Created desktop shortcut: $shortcutPath"

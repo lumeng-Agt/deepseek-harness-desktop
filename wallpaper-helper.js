@@ -9,29 +9,21 @@
  *   node wallpaper-helper.js <scene.pkg 或壁纸文件夹> [输出目录]
  *
  * 默认:
- *   输入 = D:\\Steam\\steamapps\\workshop\\content\\431960
- *   输出 = D:\\wallpaper-converted
+ *   输入 = 自动检测 Steam Wallpaper Engine 431960 目录
+ *   输出 = 用户目录/wallpaper-converted
  */
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { findWallpaperDirs, isDirectory, exists } = require('./path-discovery.js');
+const { isPathInside, sanitizeFilename } = require('./lib/path-utils.js');
 
-function exists(p) { try { return p && fs.existsSync(p); } catch (e) { return false; } }
+const MAX_PACKAGE_BYTES = 512 * 1024 * 1024;
+const MAX_TEXTURE_BYTES = 256 * 1024 * 1024;
+const MAX_ENTRIES = 100000;
 
 function findDefaultIn() {
-  if (process.env.DSHGUI_WALLPAPER_DIR && exists(process.env.DSHGUI_WALLPAPER_DIR)) return process.env.DSHGUI_WALLPAPER_DIR;
-  const steamRoots = [];
-  for (const d of ['C', 'D', 'E', 'F', 'G']) {
-    steamRoots.push(d + ':\\Steam');
-    steamRoots.push(d + ':\\steam');
-    steamRoots.push(d + ':\\Program Files (x86)\\Steam');
-    steamRoots.push(d + ':\\SteamLibrary');
-  }
-  for (const root of steamRoots) {
-    const w = path.join(root, 'steamapps', 'workshop', 'content', '431960');
-    if (exists(w)) return w;
-  }
-  return null;
+  return findWallpaperDirs()[0] || null;
 }
 
 const DEFAULT_IN = findDefaultIn();
@@ -47,24 +39,27 @@ function parsePkg(buf) {
   const version = magic.slice(4);
   let p = 12;
   const count = buf.readUInt32LE(p); p += 4;
+  if (count > MAX_ENTRIES) return null;
   const entries = [];
   for (let i = 0; i < count; i++) {
-    if (p + 8 > buf.length) break;
+    if (p + 8 > buf.length) return null;
     const nameLen = buf.readUInt32LE(p); p += 4;
-    if (p + nameLen + 8 > buf.length) break;
+    if (p + nameLen + 8 > buf.length) return null;
     const name = buf.toString('utf8', p, p + nameLen); p += nameLen;
     const offset = buf.readUInt32LE(p); p += 4;
     const size = buf.readUInt32LE(p); p += 4;
     entries.push({ name, offset, size });
   }
-  return { version, entries, dataStart: p, buf };
+  const dataSize = buf.length - p;
+  const validEntries = entries.filter((entry) => entry.offset <= dataSize && entry.size <= dataSize - entry.offset);
+  return { version, entries: validEntries, dataStart: p, buf };
 }
 
 // ---------- 从 .tex 纹理提取嵌入的 JPEG/PNG/MP4 ----------
 // 检测顺序很重要：MP4 优先（视频流里可能含 JPEG 帧，会误判），
 // 且图片签名必须出现在纹理头部附近（TEXB 头之后），避免误抓视频深处的帧。
 function extractFromTex(tex) {
-  if (!tex || tex.length < 16) return null;
+  if (!tex || tex.length < 16 || tex.length > MAX_TEXTURE_BYTES) return null;
   const HEAD = 2000; // 图片签名允许出现的最大偏移（纹理头部区域）
 
   // 1) MP4 (ftyp) — 优先，因为视频流里可能嵌有 JPEG 帧
@@ -105,20 +100,34 @@ function extractFromTex(tex) {
 
 // ---------- LZ4 块解压（纯 JS，无依赖） ----------
 function lz4Decompress(src, expectedSize) {
+  if (!Buffer.isBuffer(src) || !Number.isSafeInteger(expectedSize) || expectedSize <= 0 || expectedSize > MAX_TEXTURE_BYTES) {
+    throw new Error('invalid LZ4 output size');
+  }
   const out = Buffer.alloc(expectedSize);
   let si = 0, oi = 0;
   while (si < src.length) {
     const token = src[si++];
     let litLen = token >> 4;
-    if (litLen === 15) { let b; do { b = src[si++]; litLen += b; } while (b === 255); }
+    if (litLen === 15) {
+      let b;
+      do { if (si >= src.length) throw new Error('truncated LZ4 literal length'); b = src[si++]; litLen += b; } while (b === 255);
+    }
+    if (litLen > src.length - si || litLen > expectedSize - oi) throw new Error('invalid LZ4 literal block');
     src.copy(out, oi, si, si + litLen);
     si += litLen; oi += litLen;
     if (si >= src.length) break;
+    if (si + 2 > src.length) throw new Error('truncated LZ4 match offset');
     const offset = src.readUInt16LE(si); si += 2;
+    if (offset <= 0 || offset > oi) throw new Error('invalid LZ4 match offset');
     let matchLen = (token & 0x0f) + 4;
-    if ((token & 0x0f) === 15) { let b; do { b = src[si++]; matchLen += b; } while (b === 255); }
+    if ((token & 0x0f) === 15) {
+      let b;
+      do { if (si >= src.length) throw new Error('truncated LZ4 match length'); b = src[si++]; matchLen += b; } while (b === 255);
+    }
+    if (matchLen > expectedSize - oi) throw new Error('invalid LZ4 match block');
     for (let k = 0; k < matchLen; k++) { out[oi] = out[oi - offset]; oi++; }
   }
+  if (oi !== expectedSize) throw new Error('incomplete LZ4 output');
   return out;
 }
 
@@ -164,14 +173,14 @@ function tryLz4Texture(tex) {
   const format = tex.readUInt32LE(22);
   const width = tex.readUInt32LE(26);
   const height = tex.readUInt32LE(30);
-  if (width < 200 || height < 200 || width > 16384 || height > 16384) return null;
+  if (format !== 7 || width < 200 || height < 200 || width > 16384 || height > 16384) return null;
   // TEXB 头在 46（"TEXB0003\0" 9 字节，到 55）
   if (tex.toString('ascii', 46, 54) !== 'TEXB0003') return null;
   // 未压缩大小 @79，压缩大小 @83，数据 @87
   const uncompressedSize = tex.readUInt32LE(79);
   const compressedSize = tex.readUInt32LE(83);
   if (uncompressedSize !== width * height * 4) return null; // 必须是 RGBA
-  if (compressedSize <= 0 || compressedSize >= uncompressedSize) return null;
+  if (uncompressedSize > MAX_TEXTURE_BYTES || compressedSize <= 0 || compressedSize >= uncompressedSize || 87 + compressedSize > tex.length) return null;
   const comp = tex.slice(87, 87 + compressedSize);
   try {
     const rgba = lz4Decompress(comp, uncompressedSize);
@@ -227,7 +236,8 @@ function extractImage(buf) {
 function processWallpaper(id, outRoot) {
   const dir = path.join(INPUT_DIR, id);
   if (!fs.existsSync(dir)) return null;
-  const st = fs.statSync(dir);
+  const st = fs.lstatSync(dir);
+  if (st.isSymbolicLink()) return null;
   if (!st.isDirectory()) return null;
 
   let title = id, type = '';
@@ -235,16 +245,22 @@ function processWallpaper(id, outRoot) {
   if (fs.existsSync(pj)) {
     try { const j = JSON.parse(fs.readFileSync(pj, 'utf8')); if (j.title) title = j.title; if (j.type) type = j.type; } catch (e) {}
   }
-  const safeTitle = title.replace(/[\\/:*?"<>|]/g, '_');
+  const safeTitle = sanitizeName(title).slice(0, 160);
   const outDir = path.join(outRoot, id + '_' + safeTitle);
   if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+  const usedNames = new Set();
 
   const result = { id, title, type, files: [] };
 
   // 1) scene 类型：解析 pkg
   const pkgPath = path.join(dir, 'scene.pkg');
   if (fs.existsSync(pkgPath)) {
-    const pkg = parsePkg(fs.readFileSync(pkgPath));
+    let pkgBuffer = null;
+    try {
+      const pkgStat = fs.lstatSync(pkgPath);
+      if (!pkgStat.isSymbolicLink() && pkgStat.isFile() && pkgStat.size <= MAX_PACKAGE_BYTES) pkgBuffer = fs.readFileSync(pkgPath);
+    } catch (e) {}
+    const pkg = pkgBuffer ? parsePkg(pkgBuffer) : null;
     if (pkg) {
       // 提取所有图层纹理（多层场景有背景/人物/眼睛等多个图层）
       // 跳过 mask/particle/effect 等辅助纹理（特效遮罩，不是图层）
@@ -262,8 +278,8 @@ function processWallpaper(id, outRoot) {
           const png = encodePng(lz.width, lz.height, lz.rgba);
           const base = sanitizeName(path.basename(te.name, '.tex'));
           const fn = (extractedCount === 0 ? 'wallpaper' : base) + '.png';
-          fs.writeFileSync(path.join(outDir, fn), png);
-          result.files.push(fn);
+          const written = writeOutput(outDir, fn, png, usedNames);
+          if (written) result.files.push(written);
           extractedCount++;
           continue;
         }
@@ -271,8 +287,8 @@ function processWallpaper(id, outRoot) {
         if (ex && (ex.type === 'jpg' || ex.type === 'png' || ex.type === 'mp4')) {
           const base = sanitizeName(path.basename(te.name, '.tex'));
           const fn = (extractedCount === 0 ? 'wallpaper' : base) + '.' + ex.type;
-          fs.writeFileSync(path.join(outDir, fn), ex.data);
-          result.files.push(fn);
+          const written = writeOutput(outDir, fn, ex.data, usedNames);
+          if (written) result.files.push(written);
           extractedCount++;
         }
       }
@@ -283,19 +299,19 @@ function processWallpaper(id, outRoot) {
           try {
             const data = pkg.buf.slice(pkg.dataStart + e.offset, pkg.dataStart + e.offset + e.size);
             const fn = sanitizeName(path.basename(e.name));
-            fs.writeFileSync(path.join(outDir, fn), data);
-            result.files.push(fn);
+            const written = writeOutput(outDir, fn, data, usedNames);
+            if (written) result.files.push(written);
           } catch (err) { /* skip bad audio entry */ }
         }
       }
     }
     // 从 pkg 原始字节提取静态图（scene 里直接嵌的 PNG/JPG）
-    if (result.files.length === 0) {
-      const img = extractImage(fs.readFileSync(pkgPath));
+    if (result.files.length === 0 && pkgBuffer) {
+      const img = extractImage(pkgBuffer);
       if (img) {
         const fn = 'wallpaper.' + img.type;
-        fs.writeFileSync(path.join(outDir, fn), img.data);
-        result.files.push(fn);
+        const written = writeOutput(outDir, fn, img.data, usedNames);
+        if (written) result.files.push(written);
       }
     }
   }
@@ -305,9 +321,10 @@ function processWallpaper(id, outRoot) {
     const ext = path.extname(f).toLowerCase();
     if ((ext === '.mp4' || ext === '.webm') && !f.startsWith('hi-res') && !f.startsWith('test-extract')) {
       const src = path.join(dir, f);
-      if (fs.statSync(src).size > 1024*1024) {
-        fs.copyFileSync(src, path.join(outDir, f));
-        result.files.push(f);
+      if (!fs.lstatSync(src).isSymbolicLink() && fs.statSync(src).size > 1024*1024) {
+        const targetName = uniqueOutputName(outDir, f, usedNames);
+        fs.copyFileSync(src, path.join(outDir, targetName));
+        result.files.push(targetName);
       }
     }
   }
@@ -320,12 +337,13 @@ function processWallpaper(id, outRoot) {
       try { names = fs.readdirSync(d); } catch (e) { return; }
       for (const n of names) {
         const p = path.join(d, n);
-        let s; try { s = fs.statSync(p); } catch (e) { continue; }
+        let s; try { s = fs.lstatSync(p); } catch (e) { continue; }
+        if (s.isSymbolicLink()) continue;
         if (s.isDirectory()) { walkMedia(p); continue; }
         const ext = path.extname(n).toLowerCase();
         if (mediaExt.includes(ext) && !n.startsWith('preview') && !n.startsWith('hi-res') && !n.startsWith('test-extract') && s.size > 1024) {
           try {
-            const fn = sanitizeName(n);
+            const fn = uniqueOutputName(outDir, n, usedNames);
             fs.copyFileSync(p, path.join(outDir, fn));
             result.files.push(fn);
           } catch (e) {}
@@ -339,7 +357,7 @@ function processWallpaper(id, outRoot) {
   if (result.files.length === 0) {
     for (const p of ['preview.jpg','preview.png','preview.gif']) {
       const src = path.join(dir, p);
-      if (fs.existsSync(src)) { fs.copyFileSync(src, path.join(outDir, p)); result.files.push(p); break; }
+      if (fs.existsSync(src)) { const fn = uniqueOutputName(outDir, p, usedNames); fs.copyFileSync(src, path.join(outDir, fn)); result.files.push(fn); break; }
     }
   }
 
@@ -348,65 +366,104 @@ function processWallpaper(id, outRoot) {
 
 // ---------- 文件名清洗 ----------
 function sanitizeName(name) {
-  // 去掉 null 字节、控制字符、非法文件名字符
-  return name
-    .replace(/[\x00-\x1f\x7f]/g, '')
-    .replace(/[\\/:*?"<>|]/g, '_')
-    .trim() || 'unnamed';
+  return sanitizeFilename(name);
+}
+
+function uniqueOutputName(outDir, requested, usedNames) {
+  const safe = sanitizeName(requested);
+  const ext = path.extname(safe);
+  const stem = safe.slice(0, safe.length - ext.length) || 'unnamed';
+  let candidate = safe;
+  let index = 2;
+  while (usedNames.has(candidate.toLowerCase()) || fs.existsSync(path.join(outDir, candidate))) {
+    candidate = `${stem}_${index++}${ext}`;
+  }
+  usedNames.add(candidate.toLowerCase());
+  return candidate;
+}
+
+function writeOutput(outDir, requested, data, usedNames) {
+  try {
+    const filename = uniqueOutputName(outDir, requested, usedNames);
+    const target = path.join(outDir, filename);
+    const temp = `${target}.${process.pid}.tmp`;
+    fs.writeFileSync(temp, data);
+    fs.renameSync(temp, target);
+    return filename;
+  } catch (e) {
+    return null;
+  }
 }
 
 // ---------- 主流程 ----------
-const args = process.argv.slice(2);
-let INPUT_DIR = DEFAULT_IN;
-let OUTPUT_DIR = DEFAULT_OUT;
-if (args.length >= 1) INPUT_DIR = args[0];
-if (args.length >= 2) OUTPUT_DIR = args[1];
+let INPUT_DIR = null;
 
-if (!fs.existsSync(INPUT_DIR)) {
-  console.error('输入目录不存在: ' + INPUT_DIR);
-  process.exit(1);
-}
-if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+function run(argv = process.argv) {
+  const args = argv.slice(2);
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log('用法: node wallpaper-helper.js [输入目录或 scene.pkg] [输出目录]');
+    console.log('不传输入目录时，自动扫描 Steam Wallpaper Engine 431960 壁纸。');
+    return 0;
+  }
 
-// 判断输入是单个壁纸文件夹 / pkg 还是 workshop 根目录
-let targets = [];
-const inStat = fs.statSync(INPUT_DIR);
-if (inStat.isDirectory()) {
-  const pkgHere = path.join(INPUT_DIR, 'scene.pkg');
-  const projHere = path.join(INPUT_DIR, 'project.json');
-  if (fs.existsSync(pkgHere) || fs.existsSync(projHere)) {
-    // 单个壁纸文件夹
-    targets = [path.basename(INPUT_DIR)];
+  INPUT_DIR = args[0] || DEFAULT_IN;
+  let outputDir = args[1] || DEFAULT_OUT;
+  if (!INPUT_DIR || !exists(INPUT_DIR)) {
+    console.error('输入目录不存在或未检测到 Steam 壁纸目录: ' + (INPUT_DIR || '(空)'));
+    return 1;
+  }
+
+  let targets = [];
+  const inputStat = fs.lstatSync(INPUT_DIR);
+  if (inputStat.isDirectory()) {
+    const pkgHere = path.join(INPUT_DIR, 'scene.pkg');
+    const projectHere = path.join(INPUT_DIR, 'project.json');
+    if (exists(pkgHere) || exists(projectHere)) {
+      targets = [path.basename(INPUT_DIR)];
+      INPUT_DIR = path.dirname(INPUT_DIR);
+    } else {
+      targets = fs.readdirSync(INPUT_DIR).filter((id) => {
+        try { return fs.lstatSync(path.join(INPUT_DIR, id)).isDirectory() && !fs.lstatSync(path.join(INPUT_DIR, id)).isSymbolicLink(); } catch (e) { return false; }
+      });
+    }
+  } else if (inputStat.isFile() && INPUT_DIR.toLowerCase().endsWith('.pkg')) {
+    // A direct scene.pkg is accepted; its parent is treated as the wallpaper folder.
+    targets = [path.basename(path.dirname(INPUT_DIR))];
     INPUT_DIR = path.dirname(INPUT_DIR);
   } else {
-    targets = fs.readdirSync(INPUT_DIR).filter(id => {
-      try { return fs.statSync(path.join(INPUT_DIR, id)).isDirectory(); } catch (e) { return false; }
-    });
+    console.error('输入必须是壁纸目录、Workshop 根目录或 scene.pkg 文件');
+    return 1;
   }
-} else if (inStat.isFile() && INPUT_DIR.toLowerCase().endsWith('.pkg')) {
-  console.error('请传入包含 scene.pkg 的壁纸文件夹，而不是 pkg 文件本身');
-  process.exit(1);
+
+  INPUT_DIR = path.resolve(INPUT_DIR);
+  outputDir = path.resolve(outputDir);
+  if (isPathInside(INPUT_DIR, outputDir)) {
+    console.error('输出目录不能位于输入目录内部，以免扫描到自己生成的文件');
+    return 1;
+  }
+  if (!exists(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+  if (!isDirectory(outputDir)) { console.error('输出路径不是目录: ' + outputDir); return 1; }
+
+  let ok = 0, empty = 0, failed = 0;
+  for (const id of targets) {
+    let result = null;
+    try { result = processWallpaper(id, outputDir); }
+    catch (error) { failed++; console.log('[错误] ' + id + '  ' + (error && error.message)); continue; }
+    if (!result) continue;
+    if (result.files.length > 0) {
+      ok++;
+      console.log('[OK] ' + result.id + ' ' + result.title + '  ->  ' + result.files.join(', '));
+    } else {
+      empty++;
+      console.log('[空] ' + result.id + ' ' + result.title + '  (无法提取)');
+    }
+  }
+  console.log('');
+  console.log('完成: ' + ok + ' 个成功, ' + empty + ' 个无法提取, ' + failed + ' 个出错');
+  console.log('输出目录: ' + outputDir);
+  return failed > 0 ? 2 : 0;
 }
 
-let ok = 0, empty = 0, failed = 0;
-for (const id of targets) {
-  let r = null;
-  try {
-    r = processWallpaper(id, OUTPUT_DIR);
-  } catch (err) {
-    failed++;
-    console.log('[错误] ' + id + '  ' + (err && err.message));
-    continue;
-  }
-  if (!r) continue;
-  if (r.files.length > 0) {
-    ok++;
-    console.log('[OK] ' + r.id + ' ' + r.title + '  ->  ' + r.files.join(', '));
-  } else {
-    empty++;
-    console.log('[空] ' + r.id + ' ' + r.title + '  (无法提取)');
-  }
-}
-console.log('');
-console.log('完成: ' + ok + ' 个成功, ' + empty + ' 个无法提取, ' + failed + ' 个出错');
-console.log('输出目录: ' + OUTPUT_DIR);
+if (require.main === module) process.exitCode = run(process.argv);
+
+module.exports = { parsePkg, lz4Decompress, tryLz4Texture, sanitizeName, run };

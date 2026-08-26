@@ -1,4 +1,6 @@
-# DSH GUI
+# DeepSeek Harness Desktop
+
+当前版本将 Electron 桌面包装器、DSH 服务生命周期管理和 Wallpaper Engine 工具统一在一个可复现的项目中。仓库不包含 DSH 会话、凭据、模型配置或本机路径。
 
 把 [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness)（DSH）网页版包装成**独立桌面应用**，并附带两个实用工具：
 
@@ -11,9 +13,10 @@
 - 🐋 自带 DeepSeek 图标
 - 🎨 应用内壁纸选择器（右下角按钮），支持视频壁纸、静态壁纸、多层场景图层
 - 🔧 自动从 Wallpaper Engine 场景包提取高清图/视频（含 LZ4 压缩精灵表解码）
-- 🔒 只清理由本应用启动的 DSH 服务；外部占用 3080 端口的服务不会被强制结束
-- 🧾 在 Electron 用户数据目录记录 DSH 生命周期日志和服务状态，方便排查启动/退出问题
-- ⚙️ 自动检测路径，无需手动配置（也可用环境变量覆盖）
+- 🔒 只停止经过身份校验、由本应用启动的 DSH 服务；外部服务不会被强制结束
+- 🧾 在 Electron 用户数据目录记录有限大小的本地诊断日志和服务状态
+- ⚙️ 通过注册表、`libraryfolders.vdf` 和环境变量自动检测多个 Steam 库
+- 🚀 壁纸扫描有缓存，场景包提取结果写入应用缓存，不修改 Steam 原始文件
 
 ## 前置要求
 
@@ -25,12 +28,14 @@
 
 ### Windows 一键安装
 
-双击 `install.cmd`。脚本会检查 Node.js，按需安装 DSH，安装 Electron 依赖，生成 Windows 应用，并尝试在桌面创建 `DeepSeek Harness.lnk`。
+双击 `install.cmd`。脚本会检查 Node.js、npm 和 DSH，使用锁文件安装依赖，运行检查和测试，生成 Windows 应用，并尝试创建 `DeepSeek Harness Desktop.lnk`。
 
 ### 1. 安装依赖
 
 ```bash
-npm install
+npm ci
+npm run check
+npm test
 ```
 
 ### 2. 开发运行
@@ -45,11 +50,11 @@ npm start
 npm run pack
 ```
 
-打包结果在 `release/DeepSeek Harness-win32-x64/`，双击 `DeepSeek Harness.exe` 即可运行。
+打包结果在 `release/DeepSeek Harness Desktop-win32-x64/`，双击 `DeepSeek Harness Desktop.exe` 即可运行。
 
 应用内置 Chromium，不依赖 Edge 或 Chrome；但 DSH 命令行本身仍需单独安装，`install.cmd` 会在检测不到 `dsh` 时尝试执行 `npm install -g @deepseek-ai/dsh`。
 
-应用退出时会结束本应用自己启动的 DSH Web 子进程，并清理对应状态文件。如果 3080 端口已经被其他 DSH 实例或其他程序占用，应用会直接使用该服务，不会根据端口盲目杀进程。
+应用退出时会结束本应用自己启动的 DSH Web 子进程，并清理对应状态文件。如果端口已经被其他服务占用，应用会直接使用该服务，不会根据端口盲目杀进程。
 
 ## 环境变量（可选覆盖）
 
@@ -57,8 +62,13 @@ npm run pack
 |---|---|---|
 | `DSHGUI_NODE` | node.exe 路径 | 自动检测 |
 | `DSHGUI_DSH_BIN` | dsh 的 bin.js 路径 | 自动检测（npm 全局） |
-| `DSHGUI_WALLPAPER_DIR` | Wallpaper Engine 壁纸目录 | 自动检测（Steam 431960） |
-| `DSHGUI_WORKSPACE` | dsh 服务工作目录 | 用户主目录 |
+| `DSHGUI_WALLPAPER_DIR` | 单个 Wallpaper Engine 壁纸目录 | 自动检测（Steam 431960） |
+| `DSHGUI_WALLPAPER_DIRS` | 多个 Wallpaper Engine 目录，用分号分隔 | 自动检测 |
+| `DSHGUI_STEAM_DIRS` | 多个 Steam 根目录，用分号分隔 | 自动检测 |
+| `DSHGUI_WORKSPACE` | dsh 服务工作目录 | `~/dsh-workspace` |
+| `DSHGUI_PORT` | 本地 Web 端口（1024–65535） | `3080` |
+
+`.env.example` 只提供变量名，不应填写密钥。应用不读取、不上传 DSH 会话、凭据或 API Key。
 
 ## 壁纸文件解析助手
 
@@ -70,6 +80,9 @@ node wallpaper-helper.js [输入目录] [输出目录]
 
 - 不传参数：自动检测 Steam 壁纸目录，输出到 `~/wallpaper-converted`
 - 传一个壁纸文件夹：只处理那一个
+- 也可以直接传入 `scene.pkg`；输出目录不能位于输入目录内部
+
+解析器会校验包大小、条目边界、LZ4 长度和输出文件名；同名输出文件会自动改名，不会覆盖已有结果。
 
 支持格式：PKGV 容器（0003/0012/0018/0019/0021/0022/0023/0024）、TEX 里嵌入的 MP4/JPEG/PNG、LZ4 压缩 RGBA 精灵表、音频（mp3/wav/ogg/flac）、Web 壁纸媒体。
 
@@ -88,6 +101,21 @@ dshgui/
 ├── icon.ico / icon.png  # 图标
 └── package.json
 ```
+
+## 本地数据和提交前检查
+
+桌面应用自己的 `wallpaper.json`、`dsh-server.json`、`dsh-web.log`、`protocol.log`、`inject.log` 和 `wallpaper-cache/` 位于 Electron userData 目录。DSH 的会话、SQLite 搜索索引、凭据和模型配置由 DSH 保存在用户目录，均不属于本仓库。
+
+提交前运行：
+
+```bash
+git status --short --untracked-files=all
+npm run check
+npm test
+npm audit --audit-level=high
+```
+
+GitHub Actions 会在 push 和 pull request 上自动执行依赖安装、检查、测试和安全审计。`.gitignore` 已排除 `.dsh`、会话、SQLite、日志、缓存和 `.env` 文件。
 
 ## 许可证
 

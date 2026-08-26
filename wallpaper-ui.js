@@ -51,7 +51,7 @@
   document.head.appendChild(style);
 
   function mediaUrl(id, file) {
-    return 'wallpaper://local/' + id + '/' + encodeURIComponent(file);
+    return 'wallpaper://local/' + encodeURIComponent(id) + '/' + encodeURIComponent(file);
   }
 
   // background layer (fixed, behind app content)
@@ -69,6 +69,7 @@
     if (!sel || !sel.url) { video.pause(); video.removeAttribute('src'); video.style.display='none'; img.removeAttribute('src'); img.style.display='none'; return; }
     if (sel.isVideo) {
       img.style.display = 'none';
+      video.preload = 'metadata';
       video.src = sel.url; video.style.display = 'block';
       video.play().catch(function(){});
     } else {
@@ -115,6 +116,12 @@
     panel.appendChild(none);
 
     API.list().then(function(list){
+      if (!list.length) {
+        var empty = document.createElement('div');
+        empty.textContent = '没有找到可用壁纸；可检查 Steam 壁纸库路径。';
+        empty.style.cssText = 'padding:10px 8px;color:#aaa;font-size:12px;line-height:1.5;';
+        panel.appendChild(empty);
+      }
       list.forEach(function(w){
         const item = document.createElement('div');
         item.style.cssText = 'display:flex;align-items:center;gap:10px;padding:8px;border-radius:8px;cursor:pointer;';
@@ -122,14 +129,21 @@
         item.addEventListener('mouseleave', function(){ item.style.background='transparent'; });
         const thumb = document.createElement('img');
         thumb.src = w.preview ? mediaUrl(w.id, w.preview) : '';
+        thumb.loading = 'lazy';
+        thumb.alt = w.title || '壁纸预览';
         thumb.style.cssText = 'width:72px;height:44px;object-fit:cover;border-radius:6px;background:#333;flex:0 0 72px;';
         const label = document.createElement('div');
         label.style.cssText = 'font-size:13px;line-height:1.3;';
         label.textContent = w.title + (w.isVideo ? '  🎬' : '');
         item.appendChild(thumb); item.appendChild(label);
-        item.addEventListener('click', function(){ API.set(w.id); apply(buildSel(w)); toggle(); });
+        item.addEventListener('click', function(){ API.set(w.id).then(function(){ apply(buildSel(w)); toggle(); }).catch(function(){ label.textContent = '保存失败，请重试'; }); });
         panel.appendChild(item);
       });
+    }).catch(function(){
+      var error = document.createElement('div');
+      error.textContent = '读取壁纸失败，请稍后重试。';
+      error.style.cssText = 'padding:10px 8px;color:#f99;font-size:12px;';
+      panel.appendChild(error);
     });
   }
 
@@ -142,6 +156,10 @@
         if (w) apply(buildSel(w));
       });
     }
+  }).catch(function(){});
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) video.pause();
+    else if (video.src && video.style.display !== 'none') video.play().catch(function(){});
   });
   if (API.ping) { API.ping().catch(function(){}); }
   return 'ok';

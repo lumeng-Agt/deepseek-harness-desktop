@@ -8,6 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { spawnSync } = require('child_process');
+const { findWallpaperDirs } = require('./path-discovery.js');
 
 function exists(p) { try { return p && fs.existsSync(p); } catch (e) { return false; } }
 
@@ -59,6 +60,12 @@ function findDshBin() {
     } catch (e) {}
   }
 
+  // Yarn classic keeps global packages outside npm's global root.
+  try {
+    const yarnDir = spawnSync(process.platform === 'win32' ? 'yarn.cmd' : 'yarn', ['global', 'dir'], { encoding: 'utf8', windowsHide: true });
+    if (yarnDir.status === 0 && yarnDir.stdout) addRoot(path.join(yarnDir.stdout.trim(), 'node_modules'));
+  } catch (e) {}
+
   // Also derive the package root from a dsh shim on PATH (npm, pnpm, or yarn).
   const dshShim = findOnPath('dsh');
   if (dshShim) addRoot(path.join(path.dirname(dshShim), 'node_modules'));
@@ -70,35 +77,26 @@ function findDshBin() {
   return null;
 }
 
-// ---- Wallpaper Engine 壁纸目录（Steam 创意工坊 431960） ----
-function findWallpaperDir() {
-  if (process.env.DSHGUI_WALLPAPER_DIR && exists(process.env.DSHGUI_WALLPAPER_DIR)) return process.env.DSHGUI_WALLPAPER_DIR;
-  const steamRoots = [];
-  const drives = ['C', 'D', 'E', 'F', 'G'];
-  for (const d of drives) {
-    steamRoots.push(d + ':\\Steam');
-    steamRoots.push(d + ':\\steam');
-    steamRoots.push(d + ':\\Program Files (x86)\\Steam');
-    steamRoots.push(d + ':\\SteamLibrary');
-  }
-  for (const root of steamRoots) {
-    const w = path.join(root, 'steamapps', 'workshop', 'content', '431960');
-    if (exists(w)) return w;
-  }
-  return null;
-}
-
 // ---- 工作目录（dsh 服务启动时的工作目录） ----
 function findWorkspace() {
-  if (process.env.DSHGUI_WORKSPACE && exists(process.env.DSHGUI_WORKSPACE)) return process.env.DSHGUI_WORKSPACE;
-  return os.homedir();
+  if (process.env.DSHGUI_WORKSPACE && String(process.env.DSHGUI_WORKSPACE).trim()) return path.resolve(process.env.DSHGUI_WORKSPACE.trim());
+  // Do not grant the model the whole user profile by default.
+  return path.join(os.homedir(), 'dsh-workspace');
 }
 
+function findPort() {
+  const value = Number.parseInt(process.env.DSHGUI_PORT || '3080', 10);
+  return Number.isInteger(value) && value >= 1024 && value <= 65535 ? value : 3080;
+}
+
+const wallpaperDirs = findWallpaperDirs();
+
 module.exports = {
-  HOST: '127.0.0.1',
-  PORT: 3080,
+  HOST: ['127.0.0.1', 'localhost', '::1'].includes(process.env.DSHGUI_HOST) ? process.env.DSHGUI_HOST : '127.0.0.1',
+  PORT: findPort(),
   NODE: findNode(),
   DSH_BIN: findDshBin(),
-  WALLPAPER_DIR: findWallpaperDir(),
+  WALLPAPER_DIRS: wallpaperDirs,
+  WALLPAPER_DIR: wallpaperDirs[0] || null,
   WORKSPACE: findWorkspace()
 };
