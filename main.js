@@ -7,9 +7,12 @@ const crypto = require('crypto');
 const fs = require('fs');
 const fsp = fs.promises;
 const http = require('http');
+const os = require('os');
 const path = require('path');
+const { pathToFileURL } = require('url');
 const cfg = require('./config.js');
 const { isPathInside, parseRange, portableRelative } = require('./lib/path-utils.js');
+const { hasDshBootSignature, isDshRpcResponse } = require('./lib/dsh-probe.js');
 
 const HOST = cfg.HOST;
 const PORT = cfg.PORT;
@@ -29,6 +32,9 @@ const CACHE_PREFIX = '__dsh_cache__';
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
 const MAX_SCENE_PKG_BYTES = 512 * 1024 * 1024;
 const MAX_WALLPAPER_FILES = 5000;
+const MAX_SERVER_PROBE_BYTES = 512 * 1024;
+const SERVER_PROBE_TIMEOUT_MS = 1500;
+const WALLPAPER_SCAN_CONCURRENCY = 2;
 
 let dshChild = null;
 let dshOwnedPid = null;
@@ -39,6 +45,7 @@ let loadPromise = null;
 let catalogCache = null;
 let catalogCacheAt = 0;
 let catalogPromise = null;
+let packageExtractionTail = Promise.resolve();
 let lastServerError = '';
 
 protocol.registerSchemesAsPrivileged([
@@ -66,10 +73,23 @@ function rotateLog(file) {
   } catch (e) {}
 }
 
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function redactDiagnostic(message) {
+  let text = String(message ?? '');
+  const home = path.resolve(os.homedir());
+  if (home.length > 2) text = text.replace(new RegExp(escapeRegExp(home), 'gi'), '%USERPROFILE%');
+  return text
+    .replace(/(Bearer\s+)[^\s]+/gi, '$1<redacted>')
+    .replace(/((?:api[_-]?key|access[_-]?token|token|password)=)[^&\s]+/gi, '$1<redacted>');
+}
+
 function appendLog(file, message) {
   try {
     rotateLog(file);
-    fs.appendFileSync(file, `${new Date().toISOString()} ${message}\n`, { encoding: 'utf8' });
+    fs.appendFileSync(file, `${new Date().toISOString()} ${redactDiagnostic(message)}\n`, { encoding: 'utf8' });
   } catch (e) {}
 }
 
@@ -171,7 +191,7 @@ function extractBestImage(buf) {
     || images.sort((a, b) => b.width * b.height - a.width * a.height)[0];
 }
 
-async function extractFromPkg(pkgPath, id) {
+async function extractFromPkgInternal(pkgPath, id) {
   try {
     const linkStat = await fsp.lstat(pkgPath);
     if (linkStat.isSymbolicLink()) return null;
@@ -209,6 +229,18 @@ async function extractFromPkg(pkgPath, id) {
     appendLog(PROTOCOL_LOG_FILE, `wallpaper extraction failed: ${String(e.message || e).slice(0, 300)}`);
   }
   return null;
+}
+
+// Scene packages can be hundreds of megabytes. Keep extraction out of the
+// scan's parallel work so several large buffers cannot accumulate in the
+// Electron main process at once.
+async function extractFromPkg(pkgPath, id) {
+  const previous = packageExtractionTail;
+  let release;
+  packageExtractionTail = new Promise((resolve) => { release = resolve; });
+  await previous;
+  try { return await extractFromPkgInternal(pkgPath, id); }
+  finally { release(); }
 }
 
 async function walkFiles(dir, relativeDir = '', result = []) {
@@ -269,23 +301,39 @@ async function buildWallpaper(rootIndex, root, externalId) {
   return { id, title, type, isVideo: Boolean(media), media: media || null, preview: previewFile || null };
 }
 
+async function mapLimit(items, limit, mapper) {
+  const values = new Array(items.length);
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      try { values[index] = await mapper(items[index], index); }
+      catch (error) {
+        values[index] = null;
+        appendLog(PROTOCOL_LOG_FILE, `wallpaper scan failed: ${error.message || error}`);
+      }
+    }
+  };
+  const workerCount = Math.min(Math.max(1, Number(limit) || 1), items.length);
+  await Promise.all(Array.from({ length: workerCount }, worker));
+  return values;
+}
+
 async function readWallpapers(force = false) {
   const now = Date.now();
   if (!force && catalogCache && now - catalogCacheAt < 30_000) return catalogCache;
   if (catalogPromise) return catalogPromise;
   catalogPromise = (async () => {
-    const groups = await Promise.all(WALLPAPER_DIRS.map(async (root, rootIndex) => {
+    const jobs = [];
+    await Promise.all(WALLPAPER_DIRS.map(async (root, rootIndex) => {
       let entries;
-      try { entries = await fsp.readdir(root, { withFileTypes: true }); } catch (e) { return []; }
-      const items = [];
+      try { entries = await fsp.readdir(root, { withFileTypes: true }); } catch (e) { return; }
       for (const entry of entries) {
-        if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
-        const item = await buildWallpaper(rootIndex, root, entry.name);
-        if (item) items.push(item);
+        if (entry.isDirectory() && !entry.isSymbolicLink()) jobs.push({ rootIndex, root, id: entry.name });
       }
-      return items;
     }));
-    catalogCache = groups.flat().sort((a, b) => a.title.localeCompare(b.title, 'zh-CN'));
+    const items = await mapLimit(jobs, WALLPAPER_SCAN_CONCURRENCY, (job) => buildWallpaper(job.rootIndex, job.root, job.id));
+    catalogCache = items.filter(Boolean).sort((a, b) => a.title.localeCompare(b.title, 'zh-CN'));
     catalogCacheAt = Date.now();
     return catalogCache;
   })().finally(() => { catalogPromise = null; });
@@ -299,18 +347,56 @@ function writeSetting(value) {
 
 // ---- DSH server lifecycle ----
 
-function isServerUp() {
+function requestServer(method, requestPath, body, accept) {
   return new Promise((resolve) => {
     let settled = false;
-    const finish = (ok) => { if (settled) return; settled = true; resolve(ok); };
-    const request = http.get({ host: HOST, port: PORT, path: '/', timeout: 1500, headers: { accept: 'text/html' } }, (response) => {
-      const contentType = String(response.headers['content-type'] || '').toLowerCase();
-      response.resume();
-      response.once('end', () => finish(response.statusCode >= 200 && response.statusCode < 400 && (contentType.includes('text/html') || contentType.includes('application/xhtml'))));
+    const finish = (value) => { if (settled) return; settled = true; resolve(value); };
+    const payload = body === undefined || body === null ? null : Buffer.from(String(body));
+    const headers = { accept: accept || '*/*' };
+    if (payload) { headers['content-type'] = 'application/json'; headers['content-length'] = String(payload.length); }
+    const request = http.request({ host: HOST, port: PORT, method, path: requestPath, timeout: SERVER_PROBE_TIMEOUT_MS, headers }, (response) => {
+      const chunks = [];
+      let size = 0;
+      let truncated = false;
+      response.on('data', (chunk) => {
+        if (size >= MAX_SERVER_PROBE_BYTES) { truncated = true; return; }
+        const remaining = MAX_SERVER_PROBE_BYTES - size;
+        const part = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
+        chunks.push(part); size += part.length;
+        if (part.length < chunk.length) truncated = true;
+      });
+      response.once('aborted', () => finish({ reachable: true, statusCode: response.statusCode || 0, contentType: String(response.headers['content-type'] || ''), body: '', truncated: true }));
+      response.once('error', () => finish({ reachable: true, statusCode: response.statusCode || 0, contentType: String(response.headers['content-type'] || ''), body: '', truncated: true }));
+      response.once('end', () => finish({
+        reachable: true,
+        statusCode: response.statusCode || 0,
+        contentType: String(response.headers['content-type'] || ''),
+        body: Buffer.concat(chunks).toString('utf8'),
+        truncated
+      }));
     });
-    request.once('timeout', () => { request.destroy(); finish(false); });
-    request.once('error', () => finish(false));
+    request.once('timeout', () => { request.destroy(); finish({ reachable: false, error: 'timeout' }); });
+    request.once('error', (error) => finish({ reachable: false, error: error.message || String(error) }));
+    request.end(payload || undefined);
   });
+}
+
+async function probeDshServer() {
+  const page = await requestServer('GET', '/', null, 'text/html,application/xhtml+xml');
+  if (!page.reachable) return { reachable: false, isDsh: false, reason: page.error || '服务不可达' };
+  const htmlOk = page.statusCode >= 200 && page.statusCode < 400 && /html|xhtml/i.test(page.contentType);
+  if (!htmlOk || !hasDshBootSignature(page.body)) return { reachable: true, isDsh: false, reason: '端口服务不是可识别的 DSH' };
+
+  // The boot page identifies the product; this harmless RPC confirms that
+  // the HTTP API behind it is also DSH before the wrapper uses the port.
+  const probeBody = JSON.stringify({ type: 'client-request', rpcId: `dshgui-probe-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`, method: 'session.list', payload: {} });
+  const api = await requestServer('POST', '/api/session.list', probeBody, 'application/json');
+  const apiOk = api.reachable && api.statusCode >= 200 && api.statusCode < 300 && isDshRpcResponse(api.body);
+  return { reachable: true, isDsh: apiOk, reason: apiOk ? '' : 'DSH Web 页面存在，但 API 未通过身份校验' };
+}
+
+async function isServerUp() {
+  return (await probeDshServer()).isDsh;
 }
 
 function readDshState() {
@@ -454,9 +540,15 @@ function stopServer() {
 
 async function ensureServer() {
   lastServerError = '';
-  if (await isServerUp()) {
+  const existing = await probeDshServer();
+  if (existing.isDsh) {
     if (adoptOwnedServer() === null) appendLog(DSH_LOG_FILE, 'using an existing unowned server on the configured port');
     return true;
+  }
+  if (existing.reachable) {
+    lastServerError = existing.reason || '配置端口已有服务，但不是 DSH';
+    appendLog(DSH_LOG_FILE, `refusing configured port: ${lastServerError}`);
+    return false;
   }
   if (!BIN || !NODE) { lastServerError = '没有找到 Node.js 或 DSH 安装'; return false; }
   const child = startServer();
@@ -506,6 +598,7 @@ function streamFile(full, start, end) {
 function registerWallpaperProtocol() {
   protocol.handle('wallpaper', async (request) => {
     try {
+      if (!['GET', 'HEAD'].includes(request.method)) return new Response('Method not allowed', { status: 405, headers: { allow: 'GET, HEAD' } });
       const url = new URL(request.url);
       if (url.hostname !== 'local') return new Response('Not found', { status: 404 });
       const parts = url.pathname.split('/').filter(Boolean);
@@ -521,7 +614,7 @@ function registerWallpaperProtocol() {
       if (rangeHeader) {
         const range = parseRange(rangeHeader, total);
         if (!range) return new Response(null, { status: 416, headers: { 'content-range': `bytes */${total}` } });
-        return new Response(streamFile(resolved.full, range.start, range.end), {
+        return new Response(request.method === 'HEAD' ? null : streamFile(resolved.full, range.start, range.end), {
           status: 206,
           headers: {
             'content-type': resolved.mime, 'content-length': String(range.length),
@@ -530,7 +623,7 @@ function registerWallpaperProtocol() {
           }
         });
       }
-      return new Response(total ? streamFile(resolved.full, 0, total - 1) : null, {
+      return new Response(request.method === 'HEAD' || !total ? null : streamFile(resolved.full, 0, total - 1), {
         status: 200,
         headers: { 'content-type': resolved.mime, 'content-length': String(total), 'accept-ranges': 'bytes', 'cache-control': 'no-cache' }
       });
@@ -551,9 +644,23 @@ function isAppUrl(raw) {
   } catch (e) { return false; }
 }
 
-function isTrustedIpc(event) {
-  const url = event && event.senderFrame ? event.senderFrame.url : '';
-  return isAppUrl(url) || url.startsWith('file://');
+const TRUSTED_RETRY_PAGES = new Set([
+  pathToFileURL(path.join(__dirname, 'loading.html')).href,
+  pathToFileURL(path.join(__dirname, 'error.html')).href
+]);
+
+function senderUrl(event) {
+  return event && event.senderFrame ? event.senderFrame.url : '';
+}
+
+function isTrustedAppIpc(event) {
+  return isAppUrl(senderUrl(event));
+}
+
+function isTrustedRetryIpc(event) {
+  const url = senderUrl(event);
+  if (isAppUrl(url)) return true;
+  try { return TRUSTED_RETRY_PAGES.has(new URL(url).href); } catch (e) { return false; }
 }
 
 function openExternalSafe(raw) {
@@ -565,11 +672,11 @@ function openExternalSafe(raw) {
 
 function registerIpc() {
   ipcMain.handle('wallpaper:list', (event, options) => {
-    if (!isTrustedIpc(event)) throw new Error('Untrusted IPC sender');
+    if (!isTrustedAppIpc(event)) throw new Error('Untrusted IPC sender');
     return readWallpapers(Boolean(options && options.force));
   });
   ipcMain.handle('wallpaper:get', async (event) => {
-    if (!isTrustedIpc(event)) throw new Error('Untrusted IPC sender');
+    if (!isTrustedAppIpc(event)) throw new Error('Untrusted IPC sender');
     const setting = readSetting();
     if (setting && typeof setting.id === 'string' && !setting.id.includes(':')) {
       const match = (await readWallpapers()).find((item) => item.id.endsWith(`:${setting.id}`));
@@ -578,22 +685,22 @@ function registerIpc() {
     return setting;
   });
   ipcMain.handle('wallpaper:set', async (event, id) => {
-    if (!isTrustedIpc(event)) throw new Error('Untrusted IPC sender');
+    if (!isTrustedAppIpc(event)) throw new Error('Untrusted IPC sender');
     if (id !== null && typeof id !== 'string') throw new Error('Invalid wallpaper id');
     if (id && !(await readWallpapers()).some((item) => item.id === id)) throw new Error('Unknown wallpaper id');
     writeSetting(id ? { id } : null);
     return readSetting();
   });
   ipcMain.handle('wallpaper:status', (event) => {
-    if (!isTrustedIpc(event)) throw new Error('Untrusted IPC sender');
+    if (!isTrustedAppIpc(event)) throw new Error('Untrusted IPC sender');
     return { configured: WALLPAPER_DIRS.length > 0, roots: WALLPAPER_DIRS.length };
   });
   ipcMain.handle('wallpaper:ping', (event) => {
-    if (!isTrustedIpc(event)) throw new Error('Untrusted IPC sender');
+    if (!isTrustedAppIpc(event)) throw new Error('Untrusted IPC sender');
     appendLog(INJECT_LOG_FILE, 'injected'); return 'pong';
   });
   ipcMain.handle('app:retry', async (event) => {
-    if (!isTrustedIpc(event)) throw new Error('Untrusted IPC sender');
+    if (!isTrustedRetryIpc(event)) throw new Error('Untrusted IPC sender');
     const win = BrowserWindow.fromWebContents(event.sender);
     if (win) await loadApp(win);
     return true;
@@ -629,12 +736,25 @@ async function createWindow() {
   win.removeMenu();
   win.once('ready-to-show', () => win.show());
   win.webContents.setWindowOpenHandler(({ url }) => { openExternalSafe(url); return { action: 'deny' }; });
-  win.webContents.on('will-navigate', (event, url) => { if (!isAppUrl(url)) { event.preventDefault(); openExternalSafe(url); } });
+  const blockExternalNavigation = (event, url) => {
+    if (!isAppUrl(url)) { event.preventDefault(); openExternalSafe(url); }
+  };
+  win.webContents.on('will-navigate', blockExternalNavigation);
+  win.webContents.on('will-redirect', blockExternalNavigation);
+  win.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    if (isMainFrame && errorCode !== -3) appendLog(DSH_LOG_FILE, `web load failed code=${errorCode} description=${errorDescription} url=${validatedURL}`);
+  });
+  win.webContents.on('render-process-gone', (event, details) => {
+    appendLog(DSH_LOG_FILE, `renderer exited reason=${details.reason || 'unknown'} exitCode=${details.exitCode ?? 'null'}`);
+  });
 
   function injectWallpaperUI() {
     if (!isAppUrl(win.webContents.getURL())) return;
     fs.readFile(path.join(__dirname, 'wallpaper-ui.js'), 'utf8', (error, code) => {
-      if (!error) win.webContents.executeJavaScript(code).catch(() => {});
+      if (error) { appendLog(INJECT_LOG_FILE, `read failed: ${error.message || error}`); return; }
+      win.webContents.executeJavaScript(code).catch((injectionError) => {
+        appendLog(INJECT_LOG_FILE, `execute failed: ${injectionError.message || injectionError}`);
+      });
     });
   }
   win.webContents.on('did-finish-load', injectWallpaperUI);

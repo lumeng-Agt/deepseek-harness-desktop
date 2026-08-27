@@ -14,9 +14,12 @@
 - 🎨 应用内壁纸选择器（右下角按钮），支持视频壁纸、静态壁纸、多层场景图层
 - 🔧 自动从 Wallpaper Engine 场景包提取高清图/视频（含 LZ4 压缩精灵表解码）
 - 🔒 只停止经过身份校验、由本应用启动的 DSH 服务；外部服务不会被强制结束
+- 🛡️ 启动前校验 DSH Web 签名和 `session.list` RPC，避免误连接其他本地服务
+- 🔐 壁纸 IPC 仅对 DSH 页面开放，诊断日志会隐藏用户目录和常见凭据参数
 - 🧾 在 Electron 用户数据目录记录有限大小的本地诊断日志和服务状态
 - ⚙️ 通过注册表、`libraryfolders.vdf` 和环境变量自动检测多个 Steam 库
-- 🚀 壁纸扫描有缓存，场景包提取结果写入应用缓存，不修改 Steam 原始文件
+- 🚀 壁纸扫描有缓存和并发上限，大型场景包提取串行化，不修改 Steam 原始文件
+- 🧪 提供 DSH 运行诊断命令，并在 Linux/Windows CI 分别验证逻辑和 Windows 打包
 
 ## 前置要求
 
@@ -38,6 +41,12 @@ npm run check
 npm test
 ```
 
+检查当前 DSH 服务（只输出会话文件数量和大小，不输出会话内容或凭据）：
+
+```bash
+npm run verify
+```
+
 ### 2. 开发运行
 
 ```bash
@@ -54,7 +63,9 @@ npm run pack
 
 应用内置 Chromium，不依赖 Edge 或 Chrome；但 DSH 命令行本身仍需单独安装，`install.cmd` 会在检测不到 `dsh` 时尝试执行 `npm install -g @deepseek-ai/dsh`。
 
-应用退出时会结束本应用自己启动的 DSH Web 子进程，并清理对应状态文件。如果端口已经被其他服务占用，应用会直接使用该服务，不会根据端口盲目杀进程。
+应用退出时会结束本应用自己启动的 DSH Web 子进程，并清理对应状态文件。如果端口已经被其他服务占用，应用会拒绝误连接，不会根据端口盲目杀进程。
+
+应用现在会先验证 3080 返回的 DSH Web 签名，再验证 `session.list` RPC。若端口被其他本地服务占用，会提示端口冲突并停止启动，不会注入壁纸脚本，也不会结束该外部进程。
 
 ## 环境变量（可选覆盖）
 
@@ -84,6 +95,8 @@ node wallpaper-helper.js [输入目录] [输出目录]
 
 解析器会校验包大小、条目边界、LZ4 长度和输出文件名；同名输出文件会自动改名，不会覆盖已有结果。
 
+解析过程限制并发和输出预算：最多输出 5000 个文件、总大小 2 GiB；大场景包不会并行读入多个副本，避免占满内存或磁盘。
+
 支持格式：PKGV 容器（0003/0012/0018/0019/0021/0022/0023/0024）、TEX 里嵌入的 MP4/JPEG/PNG、LZ4 压缩 RGBA 精灵表、音频（mp3/wav/ogg/flac）、Web 壁纸媒体。
 
 ## 目录结构
@@ -104,7 +117,7 @@ dshgui/
 
 ## 本地数据和提交前检查
 
-桌面应用自己的 `wallpaper.json`、`dsh-server.json`、`dsh-web.log`、`protocol.log`、`inject.log` 和 `wallpaper-cache/` 位于 Electron userData 目录。DSH 的会话、SQLite 搜索索引、凭据和模型配置由 DSH 保存在用户目录，均不属于本仓库。
+桌面应用自己的 `wallpaper.json`、`dsh-server.json`、`dsh-web.log`、`protocol.log`、`inject.log` 和 `wallpaper-cache/` 位于 Electron userData 目录。诊断日志会将用户目录、Bearer 值及常见 token 参数脱敏。DSH 的会话、SQLite 搜索索引、凭据和模型配置由 DSH 保存在用户目录，均不属于本仓库。
 
 提交前运行：
 

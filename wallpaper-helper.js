@@ -21,6 +21,8 @@ const { isPathInside, sanitizeFilename } = require('./lib/path-utils.js');
 const MAX_PACKAGE_BYTES = 512 * 1024 * 1024;
 const MAX_TEXTURE_BYTES = 256 * 1024 * 1024;
 const MAX_ENTRIES = 100000;
+const MAX_OUTPUT_FILES = 5000;
+const MAX_OUTPUT_BYTES = 2 * 1024 * 1024 * 1024;
 
 function findDefaultIn() {
   return findWallpaperDirs()[0] || null;
@@ -249,6 +251,7 @@ function processWallpaper(id, outRoot) {
   const outDir = path.join(outRoot, id + '_' + safeTitle);
   if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
   const usedNames = new Set();
+  const outputBudget = { files: 0, bytes: 0 };
 
   const result = { id, title, type, files: [] };
 
@@ -278,7 +281,7 @@ function processWallpaper(id, outRoot) {
           const png = encodePng(lz.width, lz.height, lz.rgba);
           const base = sanitizeName(path.basename(te.name, '.tex'));
           const fn = (extractedCount === 0 ? 'wallpaper' : base) + '.png';
-          const written = writeOutput(outDir, fn, png, usedNames);
+          const written = writeOutput(outDir, fn, png, usedNames, outputBudget);
           if (written) result.files.push(written);
           extractedCount++;
           continue;
@@ -287,7 +290,7 @@ function processWallpaper(id, outRoot) {
         if (ex && (ex.type === 'jpg' || ex.type === 'png' || ex.type === 'mp4')) {
           const base = sanitizeName(path.basename(te.name, '.tex'));
           const fn = (extractedCount === 0 ? 'wallpaper' : base) + '.' + ex.type;
-          const written = writeOutput(outDir, fn, ex.data, usedNames);
+          const written = writeOutput(outDir, fn, ex.data, usedNames, outputBudget);
           if (written) result.files.push(written);
           extractedCount++;
         }
@@ -299,7 +302,7 @@ function processWallpaper(id, outRoot) {
           try {
             const data = pkg.buf.slice(pkg.dataStart + e.offset, pkg.dataStart + e.offset + e.size);
             const fn = sanitizeName(path.basename(e.name));
-            const written = writeOutput(outDir, fn, data, usedNames);
+            const written = writeOutput(outDir, fn, data, usedNames, outputBudget);
             if (written) result.files.push(written);
           } catch (err) { /* skip bad audio entry */ }
         }
@@ -310,7 +313,7 @@ function processWallpaper(id, outRoot) {
       const img = extractImage(pkgBuffer);
       if (img) {
         const fn = 'wallpaper.' + img.type;
-        const written = writeOutput(outDir, fn, img.data, usedNames);
+        const written = writeOutput(outDir, fn, img.data, usedNames, outputBudget);
         if (written) result.files.push(written);
       }
     }
@@ -322,9 +325,8 @@ function processWallpaper(id, outRoot) {
     if ((ext === '.mp4' || ext === '.webm') && !f.startsWith('hi-res') && !f.startsWith('test-extract')) {
       const src = path.join(dir, f);
       if (!fs.lstatSync(src).isSymbolicLink() && fs.statSync(src).size > 1024*1024) {
-        const targetName = uniqueOutputName(outDir, f, usedNames);
-        fs.copyFileSync(src, path.join(outDir, targetName));
-        result.files.push(targetName);
+        const targetName = copyOutput(outDir, f, src, usedNames, outputBudget);
+        if (targetName) result.files.push(targetName);
       }
     }
   }
@@ -333,6 +335,7 @@ function processWallpaper(id, outRoot) {
   if (result.files.length === 0 || type === 'web') {
     const mediaExt = ['.jpg','.jpeg','.png','.webp','.gif','.mp4','.webm','.mp3','.flac','.ogg','.wav','.m4a'];
     const walkMedia = (d) => {
+      if (outputBudget.files >= MAX_OUTPUT_FILES || outputBudget.bytes >= MAX_OUTPUT_BYTES) return;
       let names = [];
       try { names = fs.readdirSync(d); } catch (e) { return; }
       for (const n of names) {
@@ -342,11 +345,8 @@ function processWallpaper(id, outRoot) {
         if (s.isDirectory()) { walkMedia(p); continue; }
         const ext = path.extname(n).toLowerCase();
         if (mediaExt.includes(ext) && !n.startsWith('preview') && !n.startsWith('hi-res') && !n.startsWith('test-extract') && s.size > 1024) {
-          try {
-            const fn = uniqueOutputName(outDir, n, usedNames);
-            fs.copyFileSync(p, path.join(outDir, fn));
-            result.files.push(fn);
-          } catch (e) {}
+          const fn = copyOutput(outDir, n, p, usedNames, outputBudget);
+          if (fn) result.files.push(fn);
         }
       }
     };
@@ -357,7 +357,7 @@ function processWallpaper(id, outRoot) {
   if (result.files.length === 0) {
     for (const p of ['preview.jpg','preview.png','preview.gif']) {
       const src = path.join(dir, p);
-      if (fs.existsSync(src)) { const fn = uniqueOutputName(outDir, p, usedNames); fs.copyFileSync(src, path.join(outDir, fn)); result.files.push(fn); break; }
+      if (fs.existsSync(src)) { const fn = copyOutput(outDir, p, src, usedNames, outputBudget); if (fn) result.files.push(fn); break; }
     }
   }
 
@@ -382,15 +382,45 @@ function uniqueOutputName(outDir, requested, usedNames) {
   return candidate;
 }
 
-function writeOutput(outDir, requested, data, usedNames) {
+function hasOutputBudget(budget, bytes) {
+  return !budget || (budget.files < MAX_OUTPUT_FILES && budget.bytes + bytes <= MAX_OUTPUT_BYTES);
+}
+
+function writeOutput(outDir, requested, data, usedNames, budget) {
+  if (!Buffer.isBuffer(data) || !hasOutputBudget(budget, data.length)) return null;
+  let temp = null;
   try {
     const filename = uniqueOutputName(outDir, requested, usedNames);
     const target = path.join(outDir, filename);
-    const temp = `${target}.${process.pid}.tmp`;
+    temp = `${target}.${process.pid}.tmp`;
     fs.writeFileSync(temp, data);
     fs.renameSync(temp, target);
+    temp = null;
+    if (budget) { budget.files++; budget.bytes += data.length; }
     return filename;
   } catch (e) {
+    try { if (temp && fs.existsSync(temp)) fs.unlinkSync(temp); } catch (ignored) {}
+    return null;
+  }
+}
+
+function copyOutput(outDir, requested, source, usedNames, budget) {
+  let temp = null;
+  try {
+    const linkStat = fs.lstatSync(source);
+    if (linkStat.isSymbolicLink()) return null;
+    const stat = fs.statSync(source);
+    if (!stat.isFile() || !hasOutputBudget(budget, stat.size)) return null;
+    const filename = uniqueOutputName(outDir, requested, usedNames);
+    const target = path.join(outDir, filename);
+    temp = `${target}.${process.pid}.tmp`;
+    fs.copyFileSync(source, temp);
+    fs.renameSync(temp, target);
+    temp = null;
+    if (budget) { budget.files++; budget.bytes += stat.size; }
+    return filename;
+  } catch (e) {
+    try { if (temp && fs.existsSync(temp)) fs.unlinkSync(temp); } catch (ignored) {}
     return null;
   }
 }

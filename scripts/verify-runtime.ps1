@@ -13,6 +13,25 @@ try {
   exit 1
 }
 
+$hasBootSignature = ([string]$response.Content -match '__DSH_BOOT__') -and ([string]$response.Content -match 'DeepSeek\s+Harness')
+Write-Output "DSH web signature: $hasBootSignature"
+if (-not $hasBootSignature) {
+  Write-Error "3080 返回的不是可识别的 DSH Web 页面"
+  exit 1
+}
+
+$probeBody = @{ type = 'client-request'; rpcId = "dshgui-verify-$PID"; method = 'session.list'; payload = @{} } | ConvertTo-Json -Compress
+try {
+  $rpcResponse = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "http://127.0.0.1:$Port/api/session.list" -ContentType 'application/json' -Body $probeBody -TimeoutSec 5
+  $rpc = $rpcResponse.Content | ConvertFrom-Json
+  $rpcOk = ($rpc.type -eq 'server-response') -and ($rpc.result.ok -eq $true)
+  Write-Output "DSH session.list RPC: $rpcOk"
+  if (-not $rpcOk) { exit 1 }
+} catch {
+  Write-Error "DSH API 身份校验失败: $($_.Exception.Message)"
+  exit 1
+}
+
 $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($listener) {
   $process = Get-CimInstance Win32_Process -Filter "ProcessId = $($listener.OwningProcess)"

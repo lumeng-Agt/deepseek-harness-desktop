@@ -62,7 +62,14 @@ function readSteamLibraryFolders(steamRoot) {
   return roots.filter(isDirectory);
 }
 
+let steamRootsCache = null;
+
+function looksLikeSteamRoot(root) {
+  return exists(path.join(root, 'steam.exe')) || isDirectory(path.join(root, 'steamapps'));
+}
+
 function findSteamRoots() {
+  if (steamRootsCache) return [...steamRootsCache];
   const candidates = [];
   const envRoots = [process.env.DSHGUI_STEAM_DIR, process.env.DSHGUI_STEAM_DIRS]
     .filter(Boolean)
@@ -81,16 +88,22 @@ function findSteamRoots() {
       path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Steam'),
       path.join(process.env.LOCALAPPDATA || '', 'Steam')
     );
-    for (const drive of 'ABCDEFGHIJKLMNOPQRSTUVWXYZ') {
-      candidates.push(`${drive}:\\Steam`, `${drive}:\\steam`, `${drive}:\\SteamLibrary`);
-      candidates.push(`${drive}:\\Program Files\\Steam`, `${drive}:\\Program Files (x86)\\Steam`);
-    }
   } else {
     candidates.push(path.join(os.homedir(), '.steam', 'steam'), '/usr/local/steam');
   }
 
-  const roots = unique(candidates).filter(isDirectory);
-  return unique(roots.flatMap((root) => [root, ...readSteamLibraryFolders(root)]));
+  let roots = unique(candidates).filter(isDirectory);
+  // Registry and libraryfolders.vdf cover normal Steam installs. Only probe
+  // every drive when those sources do not reveal a Steam-shaped directory.
+  if (process.platform === 'win32' && !roots.some(looksLikeSteamRoot)) {
+    for (const drive of 'ABCDEFGHIJKLMNOPQRSTUVWXYZ') {
+      roots.push(`${drive}:\\Steam`, `${drive}:\\steam`, `${drive}:\\SteamLibrary`);
+      roots.push(`${drive}:\\Program Files\\Steam`, `${drive}:\\Program Files (x86)\\Steam`);
+    }
+    roots = unique(roots).filter(isDirectory);
+  }
+  steamRootsCache = unique(roots.flatMap((root) => [root, ...readSteamLibraryFolders(root)]));
+  return [...steamRootsCache];
 }
 
 function findWallpaperDirs(appId = '431960') {
