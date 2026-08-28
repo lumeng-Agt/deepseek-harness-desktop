@@ -1,28 +1,32 @@
 'use strict';
 
-const { app, BrowserWindow, shell, ipcMain, protocol } = require('electron');
+const { app, BrowserWindow, dialog, shell, ipcMain, protocol } = require('electron');
 const { execFileSync, spawn } = require('child_process');
 const { Readable } = require('stream');
 const crypto = require('crypto');
 const fs = require('fs');
 const fsp = fs.promises;
 const http = require('http');
-const os = require('os');
 const path = require('path');
 const { pathToFileURL } = require('url');
 const cfg = require('./config.js');
+const { atomicWriteFile } = require('./lib/atomic-file.js');
+const { appendLog, createRedactingLogStream, rotateLog } = require('./lib/diagnostics.js');
 const { isPathInside, parseRange, portableRelative } = require('./lib/path-utils.js');
+const { isOwnedProcess, isProcessAlive, processMetadata } = require('./lib/process-utils.js');
 const { hasDshBootSignature, isDshRpcResponse } = require('./lib/dsh-probe.js');
+const { findWallpaperDirs, resetSteamRootsCache } = require('./path-discovery.js');
 
 const HOST = cfg.HOST;
 const PORT = cfg.PORT;
 const APP_URL = `http://${HOST.includes(':') ? `[${HOST}]` : HOST}:${PORT}`;
 const NODE = cfg.NODE;
 const BIN = cfg.DSH_BIN;
-const WALLPAPER_DIRS = (cfg.WALLPAPER_DIRS || (cfg.WALLPAPER_DIR ? [cfg.WALLPAPER_DIR] : [])).filter(Boolean);
+const INITIAL_WALLPAPER_DIRS = (cfg.WALLPAPER_DIRS || (cfg.WALLPAPER_DIR ? [cfg.WALLPAPER_DIR] : [])).filter(Boolean);
 const WORKSPACE = cfg.WORKSPACE;
 const USER_DATA = app.getPath('userData');
 const SETTINGS_FILE = path.join(USER_DATA, 'wallpaper.json');
+const WALLPAPER_PATHS_FILE = path.join(USER_DATA, 'wallpaper-paths.json');
 const DSH_STATE_FILE = path.join(USER_DATA, 'dsh-server.json');
 const DSH_LOG_FILE = path.join(USER_DATA, 'dsh-web.log');
 const PROTOCOL_LOG_FILE = path.join(USER_DATA, 'protocol.log');
@@ -35,6 +39,10 @@ const MAX_WALLPAPER_FILES = 5000;
 const MAX_SERVER_PROBE_BYTES = 512 * 1024;
 const SERVER_PROBE_TIMEOUT_MS = 1500;
 const WALLPAPER_SCAN_CONCURRENCY = 2;
+const MAX_WALLPAPER_CACHE_BYTES = 1024 * 1024 * 1024;
+const MAX_WALLPAPER_CACHE_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const SERVER_WATCHDOG_INTERVAL_MS = 15 * 1000;
+const RECOVERY_DELAYS_MS = [0, 1000, 3000, 8000];
 
 let dshChild = null;
 let dshOwnedPid = null;
@@ -47,6 +55,12 @@ let catalogCacheAt = 0;
 let catalogPromise = null;
 let packageExtractionTail = Promise.resolve();
 let lastServerError = '';
+let wallpaperDirs = [];
+let manualWallpaperDirs = [];
+let serverWatchdog = null;
+let serverRecovery = null;
+let rendererRecoveryTimer = null;
+let dshVersion = undefined;
 
 protocol.registerSchemesAsPrivileged([
   { scheme: 'wallpaper', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } }
@@ -64,50 +78,72 @@ function ensureDirectory(dir) {
   try { fs.mkdirSync(dir, { recursive: true }); return true; } catch (e) { return false; }
 }
 
-function rotateLog(file) {
-  try {
-    if (!fileExists(file) || fs.statSync(file).size <= MAX_LOG_BYTES) return;
-    const rotated = file + '.1';
-    if (fileExists(rotated)) fs.unlinkSync(rotated);
-    fs.renameSync(file, rotated);
-  } catch (e) {}
-}
-
-function escapeRegExp(value) {
-  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function redactDiagnostic(message) {
-  let text = String(message ?? '');
-  const home = path.resolve(os.homedir());
-  if (home.length > 2) text = text.replace(new RegExp(escapeRegExp(home), 'gi'), '%USERPROFILE%');
-  return text
-    .replace(/(Bearer\s+)[^\s]+/gi, '$1<redacted>')
-    .replace(/((?:api[_-]?key|access[_-]?token|token|password)=)[^&\s]+/gi, '$1<redacted>');
-}
-
-function appendLog(file, message) {
-  try {
-    rotateLog(file);
-    fs.appendFileSync(file, `${new Date().toISOString()} ${redactDiagnostic(message)}\n`, { encoding: 'utf8' });
-  } catch (e) {}
-}
-
 function atomicWriteJson(file, value) {
-  const temp = `${file}.${process.pid}.tmp`;
-  try {
-    fs.writeFileSync(temp, JSON.stringify(value, null, 2), { encoding: 'utf8', mode: 0o600 });
-    fs.renameSync(temp, file);
-    return true;
-  } catch (e) {
-    try { if (fileExists(temp)) fs.unlinkSync(temp); } catch (ignored) {}
-    return false;
-  }
+  return atomicWriteFile(file, JSON.stringify(value, null, 2), { encoding: 'utf8', mode: 0o600 });
 }
 
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return null; }
 }
+
+function uniqueDirectories(paths) {
+  const result = [];
+  const seen = new Set();
+  for (const value of paths || []) {
+    if (!value || !isDirectory(value)) continue;
+    const resolved = path.resolve(value);
+    const key = process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+    if (!seen.has(key)) { seen.add(key); result.push(resolved); }
+  }
+  return result;
+}
+
+function loadManualWallpaperDirs() {
+  const saved = readJson(WALLPAPER_PATHS_FILE);
+  return Array.isArray(saved?.roots) ? uniqueDirectories(saved.roots) : [];
+}
+
+function initializeWallpaperDirs() {
+  manualWallpaperDirs = loadManualWallpaperDirs();
+  return uniqueDirectories([...INITIAL_WALLPAPER_DIRS, ...manualWallpaperDirs]);
+}
+
+function persistManualWallpaperDirs() {
+  if (!atomicWriteJson(WALLPAPER_PATHS_FILE, { roots: manualWallpaperDirs })) {
+    throw new Error('无法保存壁纸目录设置');
+  }
+}
+
+function refreshWallpaperDirs() {
+  resetSteamRootsCache();
+  wallpaperDirs = uniqueDirectories([...findWallpaperDirs(), ...manualWallpaperDirs]);
+  catalogCache = null;
+  catalogCacheAt = 0;
+  return wallpaperDirs;
+}
+
+function addWallpaperDir(directory) {
+  const resolved = path.resolve(directory);
+  if (!isDirectory(resolved)) throw new Error('壁纸目录不存在');
+  manualWallpaperDirs = uniqueDirectories([...manualWallpaperDirs, resolved]);
+  persistManualWallpaperDirs();
+  refreshWallpaperDirs();
+  return resolved;
+}
+
+function removeWallpaperDir(directory) {
+  const resolved = path.resolve(directory);
+  manualWallpaperDirs = manualWallpaperDirs.filter((item) => {
+    const left = process.platform === 'win32' ? item.toLowerCase() : item;
+    const right = process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+    return left !== right;
+  });
+  persistManualWallpaperDirs();
+  refreshWallpaperDirs();
+  return wallpaperDirs;
+}
+
+wallpaperDirs = initializeWallpaperDirs();
 
 // ---- wallpaper catalog and cache ----
 
@@ -122,17 +158,66 @@ function cacheDirForId(id) {
   return path.join(WALLPAPER_CACHE_DIR, key);
 }
 
-function atomicWriteBuffer(file, data) {
-  const temp = `${file}.${process.pid}.tmp`;
-  try {
-    ensureDirectory(path.dirname(file));
-    fs.writeFileSync(temp, data, { mode: 0o600 });
-    fs.renameSync(temp, file);
-    return true;
-  } catch (e) {
-    try { if (fileExists(temp)) fs.unlinkSync(temp); } catch (ignored) {}
-    return false;
+async function directorySize(directory) {
+  let total = 0;
+  let entries;
+  try { entries = await fsp.readdir(directory, { withFileTypes: true }); } catch (error) { return 0; }
+  for (const entry of entries) {
+    const full = path.join(directory, entry.name);
+    try {
+      const stat = await fsp.lstat(full);
+      if (stat.isSymbolicLink()) continue;
+      if (stat.isDirectory()) total += await directorySize(full);
+      else if (stat.isFile()) total += stat.size;
+    } catch (error) {}
   }
+  return total;
+}
+
+let cachePrunePromise = null;
+
+async function pruneWallpaperCache() {
+  if (cachePrunePromise) return cachePrunePromise;
+  cachePrunePromise = (async () => {
+    if (!ensureDirectory(WALLPAPER_CACHE_DIR)) return;
+    let entries;
+    try { entries = await fsp.readdir(WALLPAPER_CACHE_DIR, { withFileTypes: true }); } catch (error) { return; }
+    const now = Date.now();
+    const items = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+      const full = path.join(WALLPAPER_CACHE_DIR, entry.name);
+      try {
+        const stat = await fsp.lstat(full);
+        if (stat.isSymbolicLink()) continue;
+        const size = await directorySize(full);
+        if (now - stat.mtimeMs > MAX_WALLPAPER_CACHE_AGE_MS) {
+          await fsp.rm(full, { recursive: true, force: true });
+        } else {
+          items.push({ full, size, mtimeMs: stat.mtimeMs });
+        }
+      } catch (error) {}
+    }
+    let total = items.reduce((sum, item) => sum + item.size, 0);
+    if (total <= MAX_WALLPAPER_CACHE_BYTES) return;
+    items.sort((a, b) => a.mtimeMs - b.mtimeMs);
+    for (const item of items) {
+      if (total <= MAX_WALLPAPER_CACHE_BYTES) break;
+      try { await fsp.rm(item.full, { recursive: true, force: true }); total -= item.size; } catch (error) {}
+    }
+  })().finally(() => { cachePrunePromise = null; });
+  return cachePrunePromise;
+}
+
+async function clearWallpaperCache() {
+  await fsp.rm(WALLPAPER_CACHE_DIR, { recursive: true, force: true });
+  catalogCache = null;
+  catalogCacheAt = 0;
+  return true;
+}
+
+function atomicWriteBuffer(file, data) {
+  return atomicWriteFile(file, data, { mode: 0o600 });
 }
 
 function findFtyp(buf) {
@@ -269,7 +354,7 @@ function parseWallpaperId(id) {
   return { rootIndex, externalId, canonicalId: `${rootIndex}:${externalId}` };
 }
 
-async function buildWallpaper(rootIndex, root, externalId) {
+async function buildWallpaper(rootIndex, root, externalId, allowExtraction = false) {
   const dir = path.join(root, externalId);
   if (!isDirectory(dir)) return null;
   const id = `${rootIndex}:${externalId}`;
@@ -289,7 +374,8 @@ async function buildWallpaper(rootIndex, root, externalId) {
   let previewFile = hiRes ? hiRes.relative : (preview ? preview.relative : null);
 
   const pkgPath = path.join(dir, 'scene.pkg');
-  if (!media && (type.toLowerCase() === 'scene' || !previewFile) && fileExists(pkgPath)) {
+  const hasScenePackage = fileExists(pkgPath);
+  if (allowExtraction && !media && (type.toLowerCase() === 'scene' || !previewFile) && hasScenePackage) {
     const extracted = await extractFromPkg(pkgPath, id);
     if (extracted) {
       const cacheFile = `${CACHE_PREFIX}/${extracted.name}`;
@@ -297,8 +383,11 @@ async function buildWallpaper(rootIndex, root, externalId) {
       else previewFile = cacheFile;
     }
   }
-  if (!media && !previewFile) return null;
-  return { id, title, type, isVideo: Boolean(media), media: media || null, preview: previewFile || null };
+  if (!media && !previewFile && !hasScenePackage) return null;
+  return {
+    id, title, type, isVideo: Boolean(media), media: media || null, preview: previewFile || null,
+    canPrepare: Boolean(hasScenePackage && !media && !previewFile)
+  };
 }
 
 async function mapLimit(items, limit, mapper) {
@@ -325,19 +414,34 @@ async function readWallpapers(force = false) {
   if (catalogPromise) return catalogPromise;
   catalogPromise = (async () => {
     const jobs = [];
-    await Promise.all(WALLPAPER_DIRS.map(async (root, rootIndex) => {
+    await Promise.all(wallpaperDirs.map(async (root, rootIndex) => {
       let entries;
       try { entries = await fsp.readdir(root, { withFileTypes: true }); } catch (e) { return; }
       for (const entry of entries) {
         if (entry.isDirectory() && !entry.isSymbolicLink()) jobs.push({ rootIndex, root, id: entry.name });
       }
     }));
-    const items = await mapLimit(jobs, WALLPAPER_SCAN_CONCURRENCY, (job) => buildWallpaper(job.rootIndex, job.root, job.id));
+    const items = await mapLimit(jobs, WALLPAPER_SCAN_CONCURRENCY, (job) => buildWallpaper(job.rootIndex, job.root, job.id, false));
     catalogCache = items.filter(Boolean).sort((a, b) => a.title.localeCompare(b.title, 'zh-CN'));
     catalogCacheAt = Date.now();
     return catalogCache;
   })().finally(() => { catalogPromise = null; });
   return catalogPromise;
+}
+
+async function prepareWallpaper(id) {
+  const parsed = parseWallpaperId(id);
+  if (!parsed || parsed.rootIndex >= wallpaperDirs.length) return null;
+  const item = await buildWallpaper(parsed.rootIndex, wallpaperDirs[parsed.rootIndex], parsed.externalId, true);
+  if (!item) return null;
+  if (catalogCache) {
+    const index = catalogCache.findIndex((candidate) => candidate.id === item.id);
+    if (index >= 0) catalogCache[index] = item;
+    else catalogCache.push(item);
+    catalogCache.sort((a, b) => a.title.localeCompare(b.title, 'zh-CN'));
+  }
+  await pruneWallpaperCache();
+  return item;
 }
 
 function readSetting() { return readJson(SETTINGS_FILE); }
@@ -405,35 +509,6 @@ function readDshState() {
   return state;
 }
 
-function processMetadata(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return null;
-  if (process.platform !== 'win32') {
-    try { return { commandLine: fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ') }; } catch (e) { return null; }
-  }
-  try {
-    const script = `(Get-CimInstance Win32_Process -Filter \"ProcessId = ${pid}\") | Select-Object ProcessId,CreationDate,ExecutablePath,CommandLine | ConvertTo-Json -Compress`;
-    const output = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', windowsHide: true, timeout: 3000 }).trim();
-    return output ? JSON.parse(output) : null;
-  } catch (e) { return null; }
-}
-
-function isProcessAlive(pid) {
-  try { process.kill(pid, 0); return true; } catch (e) { return false; }
-}
-
-function isOwnedProcess(state) {
-  if (!state || !isProcessAlive(state.pid) || state.pid === process.pid) return false;
-  const meta = processMetadata(state.pid);
-  if (!meta || typeof meta.CommandLine !== 'string') return false;
-  const command = meta.CommandLine.toLowerCase().replace(/\\/g, '/');
-  const bin = path.resolve(state.bin || BIN || '').toLowerCase().replace(/\\/g, '/');
-  const sameBin = Boolean(bin) && (command.includes(bin) || command.includes(path.basename(bin)));
-  const isWeb = /(?:^|\s|["'])web(?:\s|$|["'])/i.test(meta.CommandLine);
-  if (!sameBin || !isWeb) return false;
-  if (state.processCreatedAt && meta.CreationDate && state.processCreatedAt !== meta.CreationDate) return false;
-  return true;
-}
-
 function writeDshState(pid) {
   const meta = processMetadata(pid);
   atomicWriteJson(DSH_STATE_FILE, {
@@ -454,7 +529,7 @@ function clearDshState(pid) {
 function adoptOwnedServer() {
   const state = readDshState();
   if (!state) return null;
-  if (!isOwnedProcess(state)) {
+  if (!isOwnedProcess(state, BIN)) {
     appendLog(DSH_LOG_FILE, `ignored stale or mismatched state pid=${state.pid}`);
     clearDshState(state.pid);
     return null;
@@ -469,31 +544,38 @@ function startServer() {
   if (!ensureDirectory(WORKSPACE)) { lastServerError = '工作目录不可用'; return null; }
   if (dshChild && !dshChild.killed && isProcessAlive(dshChild.pid)) return dshChild;
 
-  rotateLog(DSH_LOG_FILE);
-  const log = fs.createWriteStream(DSH_LOG_FILE, { flags: 'a' });
+  rotateLog(DSH_LOG_FILE, MAX_LOG_BYTES);
+  const stdoutLog = createRedactingLogStream(DSH_LOG_FILE, MAX_LOG_BYTES);
+  const stderrLog = createRedactingLogStream(DSH_LOG_FILE, MAX_LOG_BYTES);
   let child;
   try {
     child = spawn(NODE, [BIN, 'web', '--host', HOST, '--port', String(PORT)], {
-      cwd: WORKSPACE, detached: false, stdio: ['ignore', log, log], windowsHide: true
+      cwd: WORKSPACE, detached: false, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true
     });
   } catch (error) {
     lastServerError = `启动进程失败: ${error.message}`;
     appendLog(DSH_LOG_FILE, lastServerError);
-    log.end();
+    stdoutLog.end();
+    stderrLog.end();
     return null;
   }
+
+  if (child.stdout) child.stdout.pipe(stdoutLog);
+  if (child.stderr) child.stderr.pipe(stderrLog);
 
   dshChild = child;
   dshOwnedPid = child.pid || null;
   if (dshOwnedPid) writeDshState(dshOwnedPid);
-  appendLog(DSH_LOG_FILE, `started pid=${dshOwnedPid || 'unknown'} workspace=${WORKSPACE}`);
+  appendLog(DSH_LOG_FILE, `started pid=${dshOwnedPid || 'unknown'} version=${getDshVersion() || 'unknown'} workspace=${WORKSPACE}`);
   child.once('error', (error) => { lastServerError = `DSH 进程错误: ${error.message}`; appendLog(DSH_LOG_FILE, lastServerError); });
   child.once('exit', (code, signal) => {
     appendLog(DSH_LOG_FILE, `exited pid=${child.pid || 'unknown'} code=${code ?? 'null'} signal=${signal ?? 'null'}`);
     clearDshState(child.pid);
     if (dshChild === child) dshChild = null;
     if (dshOwnedPid === child.pid) dshOwnedPid = null;
-    log.end();
+    stdoutLog.end();
+    stderrLog.end();
+    if (!quitting && mainWindow) void recoverWindow(mainWindow, 'dsh-exit');
   });
   return child;
 }
@@ -501,7 +583,7 @@ function startServer() {
 function killServerProcess(pid, forceOwned = false) {
   if (!Number.isInteger(pid) || pid <= 0) return Promise.resolve();
   const state = readDshState();
-  if (!forceOwned && !isOwnedProcess(state)) {
+  if (!forceOwned && !isOwnedProcess(state, BIN)) {
     appendLog(DSH_LOG_FILE, `refused to stop unverified pid=${pid}`);
     return Promise.resolve();
   }
@@ -563,12 +645,72 @@ async function ensureServer() {
   return false;
 }
 
+function getDshVersion() {
+  if (dshVersion !== undefined) return dshVersion;
+  dshVersion = null;
+  if (!BIN || !NODE) return dshVersion;
+  try {
+    const output = execFileSync(NODE, [BIN, '--version'], { encoding: 'utf8', windowsHide: true, timeout: 5000 }).trim();
+    if (output) dshVersion = output.split(/\r?\n/)[0].slice(0, 120);
+  } catch (error) {}
+  return dshVersion;
+}
+
+async function recoverWindow(win, reason) {
+  if (quitting || !win || win.isDestroyed()) return;
+  if (serverRecovery) return serverRecovery;
+  serverRecovery = (async () => {
+    appendLog(DSH_LOG_FILE, `recovery started reason=${reason || 'unknown'}`);
+    for (const delay of RECOVERY_DELAYS_MS) {
+      if (quitting || win.isDestroyed()) return;
+      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+      await loadApp(win);
+      if (isAppUrl(win.webContents.getURL()) && (await probeDshServer()).isDsh) {
+        appendLog(DSH_LOG_FILE, 'recovery succeeded');
+        return;
+      }
+    }
+    appendLog(DSH_LOG_FILE, 'recovery exhausted');
+  })().catch((error) => {
+    appendLog(DSH_LOG_FILE, `recovery failed: ${error.message || error}`);
+  }).finally(() => { serverRecovery = null; });
+  return serverRecovery;
+}
+
+function stopServerWatchdog() {
+  if (serverWatchdog) {
+    clearInterval(serverWatchdog);
+    serverWatchdog = null;
+  }
+  if (rendererRecoveryTimer) {
+    clearTimeout(rendererRecoveryTimer);
+    rendererRecoveryTimer = null;
+  }
+}
+
+function startServerWatchdog(win) {
+  if (serverWatchdog) clearInterval(serverWatchdog);
+  const check = async () => {
+    if (quitting || !win || win.isDestroyed() || serverRecovery) return;
+    try {
+      const status = await probeDshServer();
+      if (!status.isDsh) {
+        appendLog(DSH_LOG_FILE, `watchdog detected server problem: ${status.reason || status.error || 'unknown'}`);
+        void recoverWindow(win, 'watchdog');
+      }
+    } catch (error) {
+      appendLog(DSH_LOG_FILE, `watchdog failed: ${error.message || error}`);
+    }
+  };
+  serverWatchdog = setInterval(check, SERVER_WATCHDOG_INTERVAL_MS);
+}
+
 // ---- wallpaper protocol ----
 
 function resolveWallpaperFile(id, file) {
   const parsed = parseWallpaperId(id);
-  if (!parsed || parsed.rootIndex >= WALLPAPER_DIRS.length || !file || file.includes('\0')) return null;
-  const sourceItemRoot = path.resolve(WALLPAPER_DIRS[parsed.rootIndex], parsed.externalId);
+  if (!parsed || parsed.rootIndex >= wallpaperDirs.length || !file || file.includes('\0')) return null;
+  const sourceItemRoot = path.resolve(wallpaperDirs[parsed.rootIndex], parsed.externalId);
   let baseRoot = sourceItemRoot;
   let full;
   const cachePath = `${CACHE_PREFIX}/`;
@@ -684,6 +826,11 @@ function registerIpc() {
     }
     return setting;
   });
+  ipcMain.handle('wallpaper:prepare', async (event, id) => {
+    if (!isTrustedAppIpc(event)) throw new Error('Untrusted IPC sender');
+    if (typeof id !== 'string' || !(await readWallpapers()).some((item) => item.id === id)) throw new Error('Unknown wallpaper id');
+    return prepareWallpaper(id);
+  });
   ipcMain.handle('wallpaper:set', async (event, id) => {
     if (!isTrustedAppIpc(event)) throw new Error('Untrusted IPC sender');
     if (id !== null && typeof id !== 'string') throw new Error('Invalid wallpaper id');
@@ -691,9 +838,34 @@ function registerIpc() {
     writeSetting(id ? { id } : null);
     return readSetting();
   });
+  ipcMain.handle('wallpaper:roots', (event) => {
+    if (!isTrustedAppIpc(event)) throw new Error('Untrusted IPC sender');
+    return { roots: [...wallpaperDirs], manual: [...manualWallpaperDirs] };
+  });
+  ipcMain.handle('wallpaper:choose-root', async (event) => {
+    if (!isTrustedAppIpc(event)) throw new Error('Untrusted IPC sender');
+    const result = await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] });
+    if (result.canceled || !result.filePaths[0]) return { canceled: true, roots: [...wallpaperDirs] };
+    addWallpaperDir(result.filePaths[0]);
+    return { canceled: false, selected: result.filePaths[0], roots: [...wallpaperDirs] };
+  });
+  ipcMain.handle('wallpaper:remove-root', (event, directory) => {
+    if (!isTrustedAppIpc(event)) throw new Error('Untrusted IPC sender');
+    if (typeof directory !== 'string' || !directory.trim()) throw new Error('Invalid wallpaper directory');
+    return removeWallpaperDir(directory.trim());
+  });
+  ipcMain.handle('wallpaper:rescan', async (event) => {
+    if (!isTrustedAppIpc(event)) throw new Error('Untrusted IPC sender');
+    refreshWallpaperDirs();
+    return readWallpapers(true);
+  });
+  ipcMain.handle('wallpaper:clear-cache', async (event) => {
+    if (!isTrustedAppIpc(event)) throw new Error('Untrusted IPC sender');
+    return clearWallpaperCache();
+  });
   ipcMain.handle('wallpaper:status', (event) => {
     if (!isTrustedAppIpc(event)) throw new Error('Untrusted IPC sender');
-    return { configured: WALLPAPER_DIRS.length > 0, roots: WALLPAPER_DIRS.length };
+    return { configured: wallpaperDirs.length > 0, roots: wallpaperDirs.length, dshVersion: getDshVersion() };
   });
   ipcMain.handle('wallpaper:ping', (event) => {
     if (!isTrustedAppIpc(event)) throw new Error('Untrusted IPC sender');
@@ -704,6 +876,15 @@ function registerIpc() {
     const win = BrowserWindow.fromWebContents(event.sender);
     if (win) await loadApp(win);
     return true;
+  });
+  ipcMain.handle('app:status', async (event) => {
+    if (!isTrustedAppIpc(event)) throw new Error('Untrusted IPC sender');
+    const server = await probeDshServer();
+    return {
+      dshVersion: getDshVersion(),
+      server: server.isDsh ? 'ready' : (server.reachable ? 'conflict' : 'offline'),
+      wallpaperRoots: wallpaperDirs.length
+    };
   });
 }
 
@@ -746,6 +927,13 @@ async function createWindow() {
   });
   win.webContents.on('render-process-gone', (event, details) => {
     appendLog(DSH_LOG_FILE, `renderer exited reason=${details.reason || 'unknown'} exitCode=${details.exitCode ?? 'null'}`);
+    if (!quitting && mainWindow === win) {
+      if (rendererRecoveryTimer) clearTimeout(rendererRecoveryTimer);
+      rendererRecoveryTimer = setTimeout(() => {
+        rendererRecoveryTimer = null;
+        void recoverWindow(win, 'renderer-exit');
+      }, 1000);
+    }
   });
 
   function injectWallpaperUI() {
@@ -758,8 +946,14 @@ async function createWindow() {
     });
   }
   win.webContents.on('did-finish-load', injectWallpaperUI);
-  win.on('closed', () => { if (mainWindow === win) mainWindow = null; });
+  win.on('closed', () => {
+    if (mainWindow === win) {
+      mainWindow = null;
+      stopServerWatchdog();
+    }
+  });
   await loadApp(win);
+  startServerWatchdog(win);
 }
 
 const gotLock = app.requestSingleInstanceLock();
@@ -770,12 +964,13 @@ else {
     if (win) { if (win.isMinimized()) win.restore(); win.focus(); }
   });
   app.whenReady().then(() => {
+    void pruneWallpaperCache();
     registerWallpaperProtocol(); registerIpc(); createWindow();
     app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
   }).catch((error) => { appendLog(DSH_LOG_FILE, `Electron startup error: ${error.message || error}`); app.quit(); });
   app.on('before-quit', (event) => {
     if (quitting) return;
-    event.preventDefault(); quitting = true;
+    event.preventDefault(); quitting = true; stopServerWatchdog();
     stopServer().finally(() => app.quit());
   });
   app.on('window-all-closed', () => app.quit());

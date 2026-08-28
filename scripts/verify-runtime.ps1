@@ -5,6 +5,18 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$dshCommand = Get-Command dsh -ErrorAction SilentlyContinue
+if ($dshCommand) {
+  try {
+    $dshVersion = (& $dshCommand.Source --version 2>$null | Select-Object -First 1)
+    Write-Output "DSH version: $dshVersion"
+  } catch {
+    Write-Output 'DSH version: unavailable'
+  }
+} else {
+  Write-Output 'DSH version: command not found'
+}
+
 try {
   $response = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$Port/" -TimeoutSec 5
   Write-Output "DSH HTTP: $([int]$response.StatusCode)"
@@ -37,6 +49,10 @@ if ($listener) {
   $process = Get-CimInstance Win32_Process -Filter "ProcessId = $($listener.OwningProcess)"
   $isDsh = $process.CommandLine -match '@deepseek-ai[\\/]dsh' -and $process.CommandLine -match '(?:^|\s|["''])web(?:\s|$|["''])'
   Write-Output "Listener PID: $($listener.OwningProcess) DSH: $isDsh"
+  if (-not $isDsh) {
+    Write-Error '监听端口的进程不是可识别的 DSH 服务'
+    exit 1
+  }
 }
 
 $sessionDir = Join-Path $DshHome 'sessions'

@@ -64,6 +64,10 @@ function readSteamLibraryFolders(steamRoot) {
 
 let steamRootsCache = null;
 
+function resetSteamRootsCache() {
+  steamRootsCache = null;
+}
+
 function looksLikeSteamRoot(root) {
   return exists(path.join(root, 'steam.exe')) || isDirectory(path.join(root, 'steamapps'));
 }
@@ -114,4 +118,4 @@ function findWallpaperDirs(appId = '431960') {
   return unique([...explicit, ...discovered]).filter(isDirectory);
 }
 
-module.exports = { findSteamRoots, findWallpaperDirs, isDirectory, exists };
+module.exports = { findSteamRoots, findWallpaperDirs, isDirectory, exists, resetSteamRootsCache };

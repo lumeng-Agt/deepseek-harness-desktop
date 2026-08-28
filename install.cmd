@@ -23,6 +23,15 @@ if errorlevel 1 (
   exit /b 1
 )
 
+for /f "delims=. tokens=1" %%v in ('node -p "process.versions.node"') do set "NODE_MAJOR=%%v"
+if not defined NODE_MAJOR set "NODE_MAJOR=0"
+if %NODE_MAJOR% LSS 22 (
+  echo [ERROR] Node.js 22 or newer is required for packaging. Current version:
+  node --version
+  pause
+  exit /b 1
+)
+
 rem Check DSH
 where dsh >nul 2>&1
 if errorlevel 1 (

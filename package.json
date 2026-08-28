@@ -1,13 +1,13 @@
 {
   "name": "deepseek-harness-desktop",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "DeepSeek Harness Desktop：DSH 桌面包装器、Wallpaper Engine 壁纸选择器与解析助手",
   "main": "main.js",
   "author": "DeepSeek Harness Desktop contributors",
   "license": "MIT",
   "private": false,
   "engines": {
-    "node": ">=18"
+    "node": ">=22.12"
   },
   "repository": {
     "type": "git",
@@ -15,12 +15,12 @@
   },
   "scripts": {
     "start": "electron .",
-    "check": "node --check main.js && node --check config.js && node --check path-discovery.js && node --check lib/path-utils.js && node --check wallpaper-helper.js",
+    "check": "node --check main.js && node --check config.js && node --check path-discovery.js && node --check preload.js && node --check wallpaper-ui.js && node --check lib/atomic-file.js && node --check lib/diagnostics.js && node --check lib/path-utils.js && node --check lib/process-utils.js && node --check wallpaper-helper.js",
     "test": "node --test",
     "audit": "npm audit --audit-level=high",
     "verify": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/verify-runtime.ps1",
-    "pack": "electron-packager . \"DeepSeek Harness Desktop\" --platform=win32 --arch=x64 --icon=icon.ico --out=release --overwrite --prune=true",
-    "pack:all": "electron-packager . \"DeepSeek Harness Desktop\" --all --icon=icon.ico --out=release --overwrite --prune=true"
+    "pack": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/pack.ps1",
+    "pack:all": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/pack.ps1 -All"
   },
   "devDependencies": {
     "@electron/packager": "^20.3.0",
