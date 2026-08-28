@@ -10,7 +10,8 @@ const { atomicWriteFile } = require('../lib/atomic-file.js');
 const { createRedactingLogStream, redactDiagnostic } = require('../lib/diagnostics.js');
 
 test('diagnostics redact paths and common credential formats', () => {
-  const result = redactDiagnostic('C:\\Users\\Alice\\project Bearer abc123 token=secret api_key: "hidden"', 'C:\\Users\\Alice');
+  const home = os.homedir();
+  const result = redactDiagnostic(`${path.join(home, 'project')} Bearer abc123 token=secret api_key: "hidden"`, home);
   assert.equal(result.includes('abc123'), false);
   assert.equal(result.includes('secret'), false);
   assert.equal(result.includes('hidden'), false);
