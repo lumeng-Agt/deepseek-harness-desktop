@@ -1,6 +1,6 @@
 {
   "name": "deepseek-harness-desktop",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "DeepSeek Harness Desktop：DSH 桌面包装器、Wallpaper Engine 壁纸选择器与解析助手",
   "main": "main.js",
   "author": "DeepSeek Harness Desktop contributors",
@@ -15,7 +15,7 @@
   },
   "scripts": {
     "start": "electron .",
-    "check": "node --check main.js && node --check config.js && node --check path-discovery.js && node --check preload.js && node --check wallpaper-ui.js && node --check lib/atomic-file.js && node --check lib/diagnostics.js && node --check lib/path-utils.js && node --check lib/process-utils.js && node --check wallpaper-helper.js",
+    "check": "node --check main.js && node --check config.js && node --check path-discovery.js && node --check preload.js && node --check error.js && node --check wallpaper-ui.js && node --check lib/atomic-file.js && node --check lib/diagnostics.js && node --check lib/path-utils.js && node --check lib/process-utils.js && node --check lib/recovery.js && node --check lib/version-utils.js && node --check lib/wallpaper-ids.js && node --check wallpaper-helper.js",
     "test": "node --test",
     "audit": "npm audit --audit-level=high",
     "verify": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/verify-runtime.ps1",

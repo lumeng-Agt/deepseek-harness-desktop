@@ -1,6 +1,6 @@
 # DeepSeek Harness Desktop
 
-当前版本将 Electron 桌面包装器、DSH 服务生命周期管理和 Wallpaper Engine 工具统一在一个可复现的项目中。仓库不包含 DSH 会话、凭据、模型配置或本机路径。
+当前版本为 `1.3.0`。项目将 Electron 桌面包装器、DSH 服务生命周期管理和 Wallpaper Engine 工具统一在一个可复现的项目中。仓库不包含 DSH 会话、凭据、模型配置或本机路径。
 
 把 [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness)（DSH）网页版包装成**独立桌面应用**，并附带两个实用工具：
 
@@ -19,8 +19,12 @@
 - 🧾 在 Electron 用户数据目录记录有限大小的本地诊断日志和服务状态
 - ⚙️ 通过注册表、`libraryfolders.vdf` 和环境变量自动检测多个 Steam 库
 - 🚀 壁纸扫描有缓存和并发上限，大型场景包提取串行化，不修改 Steam 原始文件
+- 🆔 壁纸 ID 基于壁纸根目录生成稳定标识；旧版按目录序号或裸 ID 的配置会自动迁移
+- 🔎 壁纸面板支持搜索、视频/静态/收藏/最近筛选、收藏和当前壁纸标记
 - 🗂️ 支持在应用内添加、移除和重新扫描壁纸目录
 - 🔁 DSH 或渲染进程异常时自动尝试恢复，不复制会话或上下文
+- 🧰 启动失败页提供脱敏诊断信息和复制按钮，便于排查本机安装/端口问题
+- ✅ 启动时校验 DSH 最低版本，避免连接到不兼容的运行时
 - 🧪 提供 DSH 运行诊断命令，并在 Linux/Windows CI 分别验证逻辑和 Windows 打包
 
 ## 前置要求
@@ -81,8 +85,9 @@ npm run pack
 | `DSHGUI_STEAM_DIRS` | 多个 Steam 根目录，用分号分隔 | 自动检测 |
 | `DSHGUI_WORKSPACE` | dsh 服务工作目录 | `~/dsh-workspace` |
 | `DSHGUI_PORT` | 本地 Web 端口（1024–65535） | `3080` |
+| `DSHGUI_MIN_DSH_VERSION` | 允许启动的最低 DSH 版本 | `0.1.0-rc.6` |
 
-`.env.example` 只提供变量名，不应填写密钥。应用不读取、不上传 DSH 会话、凭据或 API Key。也可以直接在右下角壁纸面板中添加目录；手动添加的目录会保存在 Electron userData 中，Steam 自动检测结果仍会在重新扫描时更新。
+`.env.example` 只提供变量名，不应填写密钥。应用不读取、不上传 DSH 会话、凭据或 API Key。也可以直接在右下角壁纸面板中添加目录；手动添加的目录会保存在 Electron userData 中，Steam 自动检测结果仍会在重新扫描时更新。修改最低版本后，重启应用才会生效。
 
 ## 壁纸文件解析助手
 
@@ -111,7 +116,7 @@ dshgui/
 ├── preload.js           # 渲染进程桥接
 ├── wallpaper-ui.js      # 壁纸选择器 UI（注入）
 ├── wallpaper-helper.js  # 壁纸文件解析助手
-├── lib/                 # 原子写入、诊断日志、进程识别和路径工具
+├── lib/                 # 原子写入、诊断日志、进程识别、恢复、版本和壁纸 ID 工具
 ├── loading.html         # 启动加载页
 ├── error.html           # 错误页
 ├── scripts/             # Windows 安装辅助脚本
@@ -132,7 +137,7 @@ npm test
 npm audit --audit-level=high
 ```
 
-GitHub Actions 会在 push 和 pull request 上自动执行依赖安装、检查、测试和安全审计；推送 `v*` 标签时还会生成带 SHA256 校验文件的 Windows portable zip Release。`.gitignore` 已排除 `.dsh`、会话、SQLite、日志、缓存和 `.env` 文件。
+GitHub Actions 会在 push 和 pull request 上自动执行依赖安装、检查、测试和安全审计；推送与 `package.json` 版本一致的 `v*` 标签时，还会生成带 SHA256 校验文件的 Windows portable zip Release。`.gitignore` 已排除 `.dsh`、会话、SQLite、日志、缓存和 `.env` 文件。
 
 ## 许可证
 

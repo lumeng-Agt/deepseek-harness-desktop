@@ -89,11 +89,17 @@ function findPort() {
   return Number.isInteger(value) && value >= 1024 && value <= 65535 ? value : 3080;
 }
 
+function findMinimumDshVersion() {
+  const value = String(process.env.DSHGUI_MIN_DSH_VERSION || '0.1.0-rc.6').trim();
+  return /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(value) ? value : '0.1.0-rc.6';
+}
+
 const wallpaperDirs = findWallpaperDirs();
 
 module.exports = {
   HOST: ['127.0.0.1', 'localhost', '::1'].includes(process.env.DSHGUI_HOST) ? process.env.DSHGUI_HOST : '127.0.0.1',
   PORT: findPort(),
+  MIN_DSH_VERSION: findMinimumDshVersion(),
   NODE: findNode(),
   DSH_BIN: findDshBin(),
   WALLPAPER_DIRS: wallpaperDirs,

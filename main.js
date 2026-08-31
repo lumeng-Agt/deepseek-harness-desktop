@@ -11,10 +11,13 @@ const path = require('path');
 const { pathToFileURL } = require('url');
 const cfg = require('./config.js');
 const { atomicWriteFile } = require('./lib/atomic-file.js');
-const { appendLog, createRedactingLogStream, rotateLog } = require('./lib/diagnostics.js');
+const { appendLog, createRedactingLogStream, redactDiagnostic, rotateLog } = require('./lib/diagnostics.js');
 const { isPathInside, parseRange, portableRelative } = require('./lib/path-utils.js');
 const { isOwnedProcess, isProcessAlive, processMetadata } = require('./lib/process-utils.js');
+const { RecoveryGate } = require('./lib/recovery.js');
 const { hasDshBootSignature, isDshRpcResponse } = require('./lib/dsh-probe.js');
+const { checkMinimumVersion } = require('./lib/version-utils.js');
+const { makeWallpaperId, parseWallpaperId, rootKey } = require('./lib/wallpaper-ids.js');
 const { findWallpaperDirs, resetSteamRootsCache } = require('./path-discovery.js');
 
 const HOST = cfg.HOST;
@@ -24,6 +27,8 @@ const NODE = cfg.NODE;
 const BIN = cfg.DSH_BIN;
 const INITIAL_WALLPAPER_DIRS = (cfg.WALLPAPER_DIRS || (cfg.WALLPAPER_DIR ? [cfg.WALLPAPER_DIR] : [])).filter(Boolean);
 const WORKSPACE = cfg.WORKSPACE;
+const WRAPPER_VERSION = require('./package.json').version;
+const MIN_DSH_VERSION = cfg.MIN_DSH_VERSION || '0.1.0-rc.6';
 const USER_DATA = app.getPath('userData');
 const SETTINGS_FILE = path.join(USER_DATA, 'wallpaper.json');
 const WALLPAPER_PATHS_FILE = path.join(USER_DATA, 'wallpaper-paths.json');
@@ -53,6 +58,7 @@ let loadPromise = null;
 let catalogCache = null;
 let catalogCacheAt = 0;
 let catalogPromise = null;
+let wallpaperScanCache = new Map();
 let packageExtractionTail = Promise.resolve();
 let lastServerError = '';
 let wallpaperDirs = [];
@@ -61,6 +67,7 @@ let serverWatchdog = null;
 let serverRecovery = null;
 let rendererRecoveryTimer = null;
 let dshVersion = undefined;
+const recoveryGate = new RecoveryGate(60_000);
 
 protocol.registerSchemesAsPrivileged([
   { scheme: 'wallpaper', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } }
@@ -114,11 +121,16 @@ function persistManualWallpaperDirs() {
   }
 }
 
+function invalidateWallpaperCatalog() {
+  catalogCache = null;
+  catalogCacheAt = 0;
+  wallpaperScanCache = new Map();
+}
+
 function refreshWallpaperDirs() {
   resetSteamRootsCache();
   wallpaperDirs = uniqueDirectories([...findWallpaperDirs(), ...manualWallpaperDirs]);
-  catalogCache = null;
-  catalogCacheAt = 0;
+  invalidateWallpaperCatalog();
   return wallpaperDirs;
 }
 
@@ -211,8 +223,7 @@ async function pruneWallpaperCache() {
 
 async function clearWallpaperCache() {
   await fsp.rm(WALLPAPER_CACHE_DIR, { recursive: true, force: true });
-  catalogCache = null;
-  catalogCacheAt = 0;
+  invalidateWallpaperCatalog();
   return true;
 }
 
@@ -344,20 +355,11 @@ async function walkFiles(dir, relativeDir = '', result = []) {
   return result;
 }
 
-function parseWallpaperId(id) {
-  if (typeof id !== 'string' || !id) return null;
-  const separator = id.indexOf(':');
-  if (separator < 0) return { rootIndex: 0, externalId: id, canonicalId: `0:${id}` };
-  const rootIndex = Number.parseInt(id.slice(0, separator), 10);
-  const externalId = id.slice(separator + 1);
-  if (!Number.isInteger(rootIndex) || rootIndex < 0 || !externalId || /[\\/]/.test(externalId)) return null;
-  return { rootIndex, externalId, canonicalId: `${rootIndex}:${externalId}` };
-}
-
 async function buildWallpaper(rootIndex, root, externalId, allowExtraction = false) {
   const dir = path.join(root, externalId);
   if (!isDirectory(dir)) return null;
-  const id = `${rootIndex}:${externalId}`;
+  const id = makeWallpaperId(root, externalId);
+  if (!id) return null;
   let title = externalId, type = '';
   try {
     const project = JSON.parse(await fsp.readFile(path.join(dir, 'project.json'), 'utf8'));
@@ -385,7 +387,7 @@ async function buildWallpaper(rootIndex, root, externalId, allowExtraction = fal
   }
   if (!media && !previewFile && !hasScenePackage) return null;
   return {
-    id, title, type, isVideo: Boolean(media), media: media || null, preview: previewFile || null,
+    id, title, type, externalId, rootKey: rootKey(root), isVideo: Boolean(media), media: media || null, preview: previewFile || null,
     canPrepare: Boolean(hasScenePackage && !media && !previewFile)
   };
 }
@@ -411,6 +413,7 @@ async function mapLimit(items, limit, mapper) {
 async function readWallpapers(force = false) {
   const now = Date.now();
   if (!force && catalogCache && now - catalogCacheAt < 30_000) return catalogCache;
+  if (force) invalidateWallpaperCatalog();
   if (catalogPromise) return catalogPromise;
   catalogPromise = (async () => {
     const jobs = [];
@@ -418,10 +421,24 @@ async function readWallpapers(force = false) {
       let entries;
       try { entries = await fsp.readdir(root, { withFileTypes: true }); } catch (e) { return; }
       for (const entry of entries) {
-        if (entry.isDirectory() && !entry.isSymbolicLink()) jobs.push({ rootIndex, root, id: entry.name });
+        if (entry.isDirectory() && !entry.isSymbolicLink()) {
+          const directory = path.join(root, entry.name);
+          try {
+            const stat = await fsp.stat(directory);
+            jobs.push({ rootIndex, root, id: entry.name, stableId: makeWallpaperId(root, entry.name), fingerprint: `${stat.mtimeMs}:${stat.size}` });
+          } catch (e) {}
+        }
       }
     }));
-    const items = await mapLimit(jobs, WALLPAPER_SCAN_CONCURRENCY, (job) => buildWallpaper(job.rootIndex, job.root, job.id, false));
+    const seen = new Set(jobs.map((job) => job.stableId).filter(Boolean));
+    for (const key of wallpaperScanCache.keys()) if (!seen.has(key)) wallpaperScanCache.delete(key);
+    const items = await mapLimit(jobs, WALLPAPER_SCAN_CONCURRENCY, async (job) => {
+      const cached = wallpaperScanCache.get(job.stableId);
+      if (cached && cached.fingerprint === job.fingerprint) return cached.item;
+      const item = await buildWallpaper(job.rootIndex, job.root, job.id, false);
+      wallpaperScanCache.set(job.stableId, { fingerprint: job.fingerprint, item });
+      return item;
+    });
     catalogCache = items.filter(Boolean).sort((a, b) => a.title.localeCompare(b.title, 'zh-CN'));
     catalogCacheAt = Date.now();
     return catalogCache;
@@ -429,10 +446,43 @@ async function readWallpapers(force = false) {
   return catalogPromise;
 }
 
-async function prepareWallpaper(id) {
+function resolveWallpaperTarget(id) {
   const parsed = parseWallpaperId(id);
-  if (!parsed || parsed.rootIndex >= wallpaperDirs.length) return null;
-  const item = await buildWallpaper(parsed.rootIndex, wallpaperDirs[parsed.rootIndex], parsed.externalId, true);
+  if (!parsed) return null;
+  let rootIndex = -1;
+  if (parsed.kind === 'stable') {
+    rootIndex = wallpaperDirs.findIndex((root) => rootKey(root) === parsed.rootKey);
+  } else if (Number.isInteger(parsed.rootIndex)) {
+    rootIndex = parsed.rootIndex;
+  }
+  if (rootIndex < 0 || rootIndex >= wallpaperDirs.length) return null;
+  const root = wallpaperDirs[rootIndex];
+  const canonicalId = makeWallpaperId(root, parsed.externalId);
+  if (!canonicalId) return null;
+  return { rootIndex, root, externalId: parsed.externalId, canonicalId };
+}
+
+function findWallpaperItem(id, items) {
+  if (!Array.isArray(items)) return null;
+  const exact = items.find((item) => item.id === id);
+  if (exact) return exact;
+  const parsed = parseWallpaperId(id);
+  const target = resolveWallpaperTarget(id);
+  const migrated = target ? items.find((item) => item.id === target.canonicalId) : null;
+  if (migrated) return migrated;
+  // Old releases encoded the root array index. If the root order changed,
+  // recover an unambiguous match by the Wallpaper Engine external ID.
+  if (parsed && (parsed.kind === 'legacy-index' || parsed.kind === 'legacy-bare')) {
+    const candidates = items.filter((item) => item.externalId === parsed.externalId);
+    if (candidates.length === 1) return candidates[0];
+  }
+  return null;
+}
+
+async function prepareWallpaper(id) {
+  const target = resolveWallpaperTarget(id);
+  if (!target) return null;
+  const item = await buildWallpaper(target.rootIndex, target.root, target.externalId, true);
   if (!item) return null;
   if (catalogCache) {
     const index = catalogCache.findIndex((candidate) => candidate.id === item.id);
@@ -440,6 +490,7 @@ async function prepareWallpaper(id) {
     else catalogCache.push(item);
     catalogCache.sort((a, b) => a.title.localeCompare(b.title, 'zh-CN'));
   }
+  wallpaperScanCache.delete(item.id);
   await pruneWallpaperCache();
   return item;
 }
@@ -624,6 +675,10 @@ async function ensureServer() {
   lastServerError = '';
   const existing = await probeDshServer();
   if (existing.isDsh) {
+    if (!ensureDshVersionCompatible()) {
+      appendLog(DSH_LOG_FILE, lastServerError);
+      return false;
+    }
     if (adoptOwnedServer() === null) appendLog(DSH_LOG_FILE, 'using an existing unowned server on the configured port');
     return true;
   }
@@ -637,7 +692,14 @@ async function ensureServer() {
   if (!child) return false;
   for (let i = 0; i < 40; i++) {
     await new Promise((resolve) => setTimeout(resolve, 1000));
-    if (await isServerUp()) return true;
+    if (await isServerUp()) {
+      if (!ensureDshVersionCompatible()) {
+        appendLog(DSH_LOG_FILE, lastServerError);
+        await stopServer();
+        return false;
+      }
+      return true;
+    }
     if (child.exitCode !== null) break;
   }
   lastServerError = lastServerError || 'DSH 服务在 40 秒内没有响应';
@@ -656,24 +718,59 @@ function getDshVersion() {
   return dshVersion;
 }
 
+function getRuntimeStatus(server) {
+  const dshVersionValue = getDshVersion();
+  const compatibility = checkMinimumVersion(dshVersionValue, MIN_DSH_VERSION);
+  return {
+    wrapperVersion: WRAPPER_VERSION,
+    dshVersion: dshVersionValue,
+    minDshVersion: MIN_DSH_VERSION,
+    dshCompatible: compatibility.compatible,
+    dshCompatibilityReason: compatibility.reason,
+    server: server?.isDsh ? 'ready' : (server?.reachable ? 'conflict' : 'offline'),
+    serverReason: redactDiagnostic(server?.reason || ''),
+    wallpaperRoots: wallpaperDirs.length,
+    port: PORT
+  };
+}
+
+function ensureDshVersionCompatible() {
+  const compatibility = checkMinimumVersion(getDshVersion(), MIN_DSH_VERSION);
+  if (compatibility.compatible === false) {
+    lastServerError = `DSH 版本过低：当前 ${getDshVersion() || '未知'}，需要 ${MIN_DSH_VERSION} 或更高版本`;
+    return false;
+  }
+  return true;
+}
+
 async function recoverWindow(win, reason) {
   if (quitting || !win || win.isDestroyed()) return;
   if (serverRecovery) return serverRecovery;
+  if (!recoveryGate.tryStart()) return false;
+  let succeeded = false;
   serverRecovery = (async () => {
     appendLog(DSH_LOG_FILE, `recovery started reason=${reason || 'unknown'}`);
     for (const delay of RECOVERY_DELAYS_MS) {
       if (quitting || win.isDestroyed()) return;
       if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
       await loadApp(win);
-      if (isAppUrl(win.webContents.getURL()) && (await probeDshServer()).isDsh) {
+      let appReady = false;
+      try { appReady = isAppUrl(win.webContents.getURL()); } catch (error) {}
+      if (appReady && (await probeDshServer()).isDsh && ensureDshVersionCompatible()) {
         appendLog(DSH_LOG_FILE, 'recovery succeeded');
-        return;
+        succeeded = true;
+        return true;
       }
     }
     appendLog(DSH_LOG_FILE, 'recovery exhausted');
+    return false;
   })().catch((error) => {
     appendLog(DSH_LOG_FILE, `recovery failed: ${error.message || error}`);
-  }).finally(() => { serverRecovery = null; });
+    return false;
+  }).finally(() => {
+    recoveryGate.finish(succeeded);
+    serverRecovery = null;
+  });
   return serverRecovery;
 }
 
@@ -692,6 +789,7 @@ function startServerWatchdog(win) {
   if (serverWatchdog) clearInterval(serverWatchdog);
   const check = async () => {
     if (quitting || !win || win.isDestroyed() || serverRecovery) return;
+    if (!recoveryGate.canStart()) return;
     try {
       const status = await probeDshServer();
       if (!status.isDsh) {
@@ -708,14 +806,14 @@ function startServerWatchdog(win) {
 // ---- wallpaper protocol ----
 
 function resolveWallpaperFile(id, file) {
-  const parsed = parseWallpaperId(id);
-  if (!parsed || parsed.rootIndex >= wallpaperDirs.length || !file || file.includes('\0')) return null;
-  const sourceItemRoot = path.resolve(wallpaperDirs[parsed.rootIndex], parsed.externalId);
+  const target = resolveWallpaperTarget(id);
+  if (!target || !file || file.includes('\0')) return null;
+  const sourceItemRoot = path.resolve(target.root, target.externalId);
   let baseRoot = sourceItemRoot;
   let full;
   const cachePath = `${CACHE_PREFIX}/`;
   if (file === CACHE_PREFIX || file.startsWith(cachePath)) {
-    baseRoot = cacheDirForId(parsed.canonicalId);
+    baseRoot = cacheDirForId(target.canonicalId);
     full = path.resolve(baseRoot, file.slice(cachePath.length));
   } else full = path.resolve(sourceItemRoot, file);
 
@@ -744,11 +842,18 @@ function registerWallpaperProtocol() {
       const url = new URL(request.url);
       if (url.hostname !== 'local') return new Response('Not found', { status: 404 });
       const parts = url.pathname.split('/').filter(Boolean);
-      const id = decodeURIComponent(parts.shift() || '');
-      const file = decodeURIComponent(parts.join('/'));
+      let id;
+      let file;
+      try {
+        id = decodeURIComponent(parts.shift() || '');
+        file = decodeURIComponent(parts.join('/'));
+      } catch (error) {
+        appendLog(PROTOCOL_LOG_FILE, '400 malformed wallpaper URI');
+        return new Response('Bad request', { status: 400 });
+      }
       const resolved = resolveWallpaperFile(id, file);
       if (!resolved) {
-        appendLog(PROTOCOL_LOG_FILE, `404 ${request.url}`);
+        appendLog(PROTOCOL_LOG_FILE, `404 wallpaper resource method=${request.method}`);
         return new Response('Not found', { status: 404 });
       }
       const total = resolved.stat.size;
@@ -820,22 +925,24 @@ function registerIpc() {
   ipcMain.handle('wallpaper:get', async (event) => {
     if (!isTrustedAppIpc(event)) throw new Error('Untrusted IPC sender');
     const setting = readSetting();
-    if (setting && typeof setting.id === 'string' && !setting.id.includes(':')) {
-      const match = (await readWallpapers()).find((item) => item.id.endsWith(`:${setting.id}`));
-      if (match) return { id: match.id };
-    }
-    return setting;
+    if (!setting || typeof setting.id !== 'string') return null;
+    const match = findWallpaperItem(setting.id, await readWallpapers());
+    if (!match) return null;
+    if (match.id !== setting.id) writeSetting({ id: match.id });
+    return { id: match.id };
   });
   ipcMain.handle('wallpaper:prepare', async (event, id) => {
     if (!isTrustedAppIpc(event)) throw new Error('Untrusted IPC sender');
-    if (typeof id !== 'string' || !(await readWallpapers()).some((item) => item.id === id)) throw new Error('Unknown wallpaper id');
-    return prepareWallpaper(id);
+    const match = typeof id === 'string' ? findWallpaperItem(id, await readWallpapers()) : null;
+    if (!match) throw new Error('Unknown wallpaper id');
+    return prepareWallpaper(match.id);
   });
   ipcMain.handle('wallpaper:set', async (event, id) => {
     if (!isTrustedAppIpc(event)) throw new Error('Untrusted IPC sender');
     if (id !== null && typeof id !== 'string') throw new Error('Invalid wallpaper id');
-    if (id && !(await readWallpapers()).some((item) => item.id === id)) throw new Error('Unknown wallpaper id');
-    writeSetting(id ? { id } : null);
+    const match = id ? findWallpaperItem(id, await readWallpapers()) : null;
+    if (id && !match) throw new Error('Unknown wallpaper id');
+    writeSetting(match ? { id: match.id } : null);
     return readSetting();
   });
   ipcMain.handle('wallpaper:roots', (event) => {
@@ -865,7 +972,12 @@ function registerIpc() {
   });
   ipcMain.handle('wallpaper:status', (event) => {
     if (!isTrustedAppIpc(event)) throw new Error('Untrusted IPC sender');
-    return { configured: wallpaperDirs.length > 0, roots: wallpaperDirs.length, dshVersion: getDshVersion() };
+    const compatibility = checkMinimumVersion(getDshVersion(), MIN_DSH_VERSION);
+    return {
+      configured: wallpaperDirs.length > 0, roots: wallpaperDirs.length,
+      wrapperVersion: WRAPPER_VERSION, dshVersion: getDshVersion(), minDshVersion: MIN_DSH_VERSION,
+      dshCompatible: compatibility.compatible
+    };
   });
   ipcMain.handle('wallpaper:ping', (event) => {
     if (!isTrustedAppIpc(event)) throw new Error('Untrusted IPC sender');
@@ -878,13 +990,24 @@ function registerIpc() {
     return true;
   });
   ipcMain.handle('app:status', async (event) => {
-    if (!isTrustedAppIpc(event)) throw new Error('Untrusted IPC sender');
+    if (!isTrustedRetryIpc(event)) throw new Error('Untrusted IPC sender');
     const server = await probeDshServer();
-    return {
-      dshVersion: getDshVersion(),
-      server: server.isDsh ? 'ready' : (server.reachable ? 'conflict' : 'offline'),
-      wallpaperRoots: wallpaperDirs.length
-    };
+    return getRuntimeStatus(server);
+  });
+  ipcMain.handle('app:diagnostics', async (event) => {
+    if (!isTrustedRetryIpc(event)) throw new Error('Untrusted IPC sender');
+    const server = await probeDshServer();
+    const status = getRuntimeStatus(server);
+    return [
+      `DeepSeek Harness Desktop ${status.wrapperVersion}`,
+      `DSH Runtime ${status.dshVersion || '未检测到'}`,
+      `最低 DSH 版本 ${status.minDshVersion}`,
+      `服务状态 ${status.server}`,
+      `兼容状态 ${status.dshCompatible === true ? '正常' : (status.dshCompatible === false ? '版本过低' : '无法确认')}`,
+      `错误 ${redactDiagnostic(lastServerError || status.serverReason || '无')}`,
+      `壁纸目录 ${status.wallpaperRoots}`,
+      `端口 ${status.port}`
+    ].join('\n');
   });
 }
 

@@ -11,10 +11,13 @@ const { createRedactingLogStream, redactDiagnostic } = require('../lib/diagnosti
 
 test('diagnostics redact paths and common credential formats', () => {
   const home = os.homedir();
-  const result = redactDiagnostic(`${path.join(home, 'project')} Bearer abc123 token=secret api_key: "hidden"`, home);
+  const result = redactDiagnostic(`${path.join(home, 'project')} Bearer abc123 token=secret api_key: "hidden" authorization=abc x-api-key: xyz https://alice:password@example.com`, home);
   assert.equal(result.includes('abc123'), false);
   assert.equal(result.includes('secret'), false);
   assert.equal(result.includes('hidden'), false);
+  assert.equal(result.includes('abc '), false);
+  assert.equal(result.includes('xyz'), false);
+  assert.equal(result.includes('alice:password'), false);
   assert.equal(result.includes('%USERPROFILE%'), true);
 });
 

@@ -16,5 +16,6 @@ contextBridge.exposeInMainWorld('wallpaper', {
 
 contextBridge.exposeInMainWorld('dshApp', {
   retry: () => ipcRenderer.invoke('app:retry'),
-  status: () => ipcRenderer.invoke('app:status')
+  status: () => ipcRenderer.invoke('app:status'),
+  diagnostics: () => ipcRenderer.invoke('app:diagnostics')
 });
